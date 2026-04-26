@@ -48,7 +48,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "3.6"
+VERSION = "3.7"
 
 # Paths
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
