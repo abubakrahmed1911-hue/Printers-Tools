@@ -1,0 +1,10 @@
+{
+  "version": "3.3",
+  "files": {
+    "src/daemon.py": "2864f9be93ad115c4e28649b4b97e1bbad81d4873ff2d141687ab29f058c45b8",
+    "src/gui.py": "cde79e1cceb38f9e14f3b3ad015dcad74c34667476f3062dab2114fba8514a5e",
+    "version.json": "10e47ad3a8d8a4f0dd00608fe666f9a7f63d69870a9ad95a2b03f9a3e700df9e"
+  },
+  "changelog": "v3.3: full Printers-Tools merge \u2014 network scan, XP-80, SPRT, Kyocera auto-install, remove printer, quick fix spooler",
+  "signature": "RUN_release.bat_3.3_TO_SIGN"
+}
