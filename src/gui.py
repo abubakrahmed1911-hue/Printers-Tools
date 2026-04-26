@@ -34,7 +34,7 @@ import re
 
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
 CONFIG_PATH = "/etc/it-aman/config.json"
-APP_VERSION = "3.14"
+APP_VERSION = "3.15"
 APP_NAME = "IT Aman - Printer Support Tool"
 DEVELOPER = "Developed by: IT Helpdesk Operation"
 
@@ -375,8 +375,8 @@ window {
 .header-bar {
     background: linear-gradient(135deg, @primary, @primary_dark);
     color: white;
-    padding: 16px 24px;
-    border-radius: 0 0 12px 12px;
+    padding: 8px 16px;
+    border-radius: 0 0 8px 8px;
 }
 
 .header-bar .title-label {
@@ -418,11 +418,11 @@ window {
 
 .card-clickable {
     background-color: @card_bg;
-    border-radius: 12px;
-    padding: 18px;
-    margin: 6px;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-    transition: all 150ms ease;
+    border-radius: 8px;
+    padding: 10px;
+    margin: 3px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+    transition: all 100ms ease;
 }
 
 .card-clickable:hover {
@@ -570,11 +570,11 @@ window {
 
 .printer-result-card {
     background-color: @card_bg;
-    border-radius: 12px;
-    padding: 16px;
-    margin: 8px;
-    box-shadow: 0 2px 6px rgba(0,0,0,0.06);
-    border-left: 4px solid @primary;
+    border-radius: 8px;
+    padding: 8px 12px;
+    margin: 3px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    border-left: 3px solid @primary;
 }
 
 .brand-card {
@@ -2035,7 +2035,7 @@ class RepairScreen(Gtk.Box):
         self.printer_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scrolled.set_min_content_height(180)  # Ensure at least 3 printers visible
+        scrolled.set_min_content_height(250)  # Show at least 4-5 printers visible
         scrolled.add(self.printer_list)
         self.pack_start(scrolled, True, True, 0)
 
@@ -2083,40 +2083,31 @@ class RepairScreen(Gtk.Box):
             return
 
         for prn in printers:
-            card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
             card.get_style_context().add_class("printer-result-card")
             name = prn.get("name", "Unknown")
             state = prn.get("state", "unknown")
 
-            info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            # Name + State on same line for compact display
+            name_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
             name_lbl = Gtk.Label()
-            name_lbl.set_markup(f"<span size='small' weight='bold'>{name}</span>")
+            name_lbl.set_markup(f"<span weight='bold'>{name}</span>")
             name_lbl.set_xalign(0.0 if lang != "ar" else 1.0)
-            info.pack_start(name_lbl, False, False, 0)
+            name_row.pack_start(name_lbl, False, False, 0)
 
-            # Show state for ALL printers
             state_txt = t('status_disabled', lang) if state in ("disabled", "stopped") else t('status_enabled', lang)
             state_clr = '#F44336' if state in ("disabled", "stopped") else '#4CAF50'
             state_lbl = Gtk.Label()
-            state_lbl.set_markup(f"<span size='small' color='{state_clr}'>{state_txt}</span>")
-            state_lbl.set_xalign(0.0 if lang != "ar" else 1.0)
-            info.pack_start(state_lbl, False, False, 0)
-
-            # Show device URI (compact)
-            device = prn.get("device", "")
-            if device and len(device) > 50:
-                device = device[:47] + "..."
-            if device:
-                dev_lbl = Gtk.Label()
-                dev_lbl.set_markup(f"<span size='x-small' color='#757575'>{device}</span>")
-                dev_lbl.set_xalign(0.0 if lang != "ar" else 1.0)
-                info.pack_start(dev_lbl, False, False, 0)
+            state_lbl.set_markup(f"<span size='small' color='{state_clr}' weight='bold'>{state_txt}</span>")
+            name_row.pack_start(state_lbl, False, False, 0)
+            info.pack_start(name_row, False, False, 0)
 
             card.pack_start(info, True, True, 0)
 
             fix_btn = Gtk.Button(label=t("menu_repair", lang))
             fix_btn.get_style_context().add_class("btn-primary")
-            fix_btn.set_size_request(100, 30)
+            fix_btn.set_size_request(80, 28)
 
             def _fix(btn, pname=name):
                 btn.set_sensitive(False)
@@ -2262,10 +2253,10 @@ class StatusScreen(Gtk.Box):
         self.spinner.set_size_request(32, 32)
         self.pack_start(self.spinner, False, False, 0)
 
-        self.printer_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.printer_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scrolled.set_min_content_height(180)  # Ensure at least 3 printers visible
+        scrolled.set_min_content_height(250)  # Show at least 4-5 printers visible
         scrolled.add(self.printer_list)
         self.pack_start(scrolled, True, True, 0)
 
@@ -2509,9 +2500,12 @@ class ITAmanApp(Gtk.Window):
             else:
                 self.set_default_size(800, 580)
         else:
-            self.set_default_size(800, 580)
+            self.set_default_size(720, 520)
 
         self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_resizable(True)
+        # Allow easy closing with Escape key
+        self.connect("key-press-event", self._on_key_press)
 
         if os.path.exists(ICON_PATH):
             try:
@@ -2571,6 +2565,13 @@ class ITAmanApp(Gtk.Window):
         self.main_box.pack_start(self.footer, False, False, 0)
 
     # ── helpers ──
+
+    def _on_key_press(self, widget, event):
+        """Close window on Escape key press for easy exit."""
+        if event.keyval == Gdk.KEY_Escape:
+            self.destroy()
+            return True
+        return False
 
     def set_header(self, title, subtitle=""):
         self.header_title.set_text(title)

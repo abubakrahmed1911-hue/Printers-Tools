@@ -64,7 +64,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "3.14"
+VERSION = "3.15"
 
 # Paths
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
@@ -98,43 +98,31 @@ SPRT_DRIVER_URL = (
 PRINTER_DEFINITIONS_URL = f"{RAW_BASE}/printer_definitions.json"
 
 # Predefined printer name templates (also synced from GitHub)
-# These are the standard naming conventions for branches.
-# The GUI uses BASE_NAMES to generate auto-incremented names.
-# e.g., Operation MF, Operation 2 MF, Operation 3 MF ...
-#       FS, FS2, FS3 ...
+# ONLY the names specified by IT management:
+#   Primary: Operation MF, Accountant MF
+#   Duplicates: Operation 2 MF, Accountant 2 MF, etc.
+#   Additional/Thermal: FS, FS2, FS3, etc.
+# Do NOT add other names without approval.
 
 PRINTER_BASE_NAMES = [
     "Operation MF",
     "Accountant MF",
     "FS",
-    "HR MF",
-    "Reception MF",
-    "Manager MF",
-    "IT MF",
-    "GM MF",
 ]
 
 PRINTER_NAME_TEMPLATES = [
     "Operation MF",
     "Accountant MF",
     "FS",
-    "HR MF",
-    "Reception MF",
-    "Manager MF",
-    "IT MF",
-    "GM MF",
     "Operation 2 MF",
     "Accountant 2 MF",
     "FS2",
-    "FS3",
-    "FS4",
-    "HR 2 MF",
-    "Reception 2 MF",
-    "Manager 2 MF",
-    "IT 2 MF",
-    "GM 2 MF",
     "Operation 3 MF",
     "Accountant 3 MF",
+    "FS3",
+    "Operation 4 MF",
+    "Accountant 4 MF",
+    "FS4",
     "FS5",
     "FS6",
 ]
