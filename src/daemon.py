@@ -48,7 +48,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "3.7"
+VERSION = "3.6"
 
 # Paths
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
@@ -2181,14 +2181,14 @@ _auto_update_stop = threading.Event()
 def _auto_update_loop():
     """
     Background thread that periodically checks GitHub for updates.
-    When a newer version is found, it automatically calls handle_update_all
-    which downloads, verifies (Ed25519), and applies the update — then
-    the daemon restarts itself.
+    When a newer version is found, it logs it but does NOT auto-install.
+    The GUI will detect the new version via check_update and show a
+    notification banner for the user to click and install.
 
     The check interval is controlled by AUTO_UPDATE_INTERVAL (default 60s).
     Set AUTO_UPDATE_ENABLED = False to disable.
     """
-    log.info("Auto-update loop started — checking every %d seconds", AUTO_UPDATE_INTERVAL)
+    log.info("Auto-update check loop started — checking every %d seconds", AUTO_UPDATE_INTERVAL)
 
     # Wait a bit on first start so the daemon settles before checking
     _auto_update_stop.wait(30)
@@ -2205,27 +2205,19 @@ def _auto_update_loop():
 
                     if remote_version and _compare_versions(remote_version, VERSION) > 0:
                         log.info(
-                            "Auto-update: new version detected! %s -> %s. Applying update...",
+                            "Update available: %s -> %s (GUI will notify user)",
                             VERSION, remote_version,
                         )
-                        # Call handle_update_all to download, verify, and apply
-                        result = handle_update_all({})
-                        if result.get("status") == "ok":
-                            log.info("Auto-update applied successfully: %s", result.get("actions", []))
-                            # handle_update_all schedules a restart, so we'll exit
-                            return
-                        else:
-                            log.warning("Auto-update failed: %s", result.get("message", "unknown error"))
                     else:
-                        log.debug("Auto-update: already up to date (local=%s, remote=%s)", VERSION, remote_version)
+                        log.debug("Update check: already up to date (local=%s, remote=%s)", VERSION, remote_version)
 
                 except json.JSONDecodeError:
-                    log.debug("Auto-update: invalid version.json from GitHub")
+                    log.debug("Update check: invalid version.json from GitHub")
             else:
-                log.debug("Auto-update: could not reach GitHub")
+                log.debug("Update check: could not reach GitHub")
 
         except Exception as exc:
-            log.debug("Auto-update check error (non-fatal): %s", exc)
+            log.debug("Update check error (non-fatal): %s", exc)
 
         # Wait for the next check interval (or stop signal)
         _auto_update_stop.wait(AUTO_UPDATE_INTERVAL)
