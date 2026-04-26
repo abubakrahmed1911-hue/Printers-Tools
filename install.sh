@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
-# IT Aman Printer Tool v3.4 — Installation Script
+# IT Aman Printer Tool v3.6 — Installation Script
 # ═══════════════════════════════════════════════════════════
 
 set -e
@@ -15,7 +15,7 @@ SERVICE_FILE="/etc/systemd/system/it-aman.service"
 DESKTOP_FILE="/usr/share/applications/it-aman.desktop"
 
 echo "========================================"
-echo " IT Aman Printer Tool v3.4 Installer"
+echo " IT Aman Printer Tool v3.6 Installer"
 echo "========================================"
 echo ""
 
@@ -32,8 +32,13 @@ apt-get install -y -qq python3 python3-gi python3-gi-cairo gir1.2-gtk-3.0 \
     cups cups-bsd avahi-daemon avahi-utils \
     curl wget 2>/dev/null || true
 
-# ── 2. Download files from GitHub ──
-echo "[2/7] Downloading IT Aman files..."
+# ── 2. Stop old service if running ──
+echo "[2/7] Stopping old service (if any)..."
+systemctl stop it-aman.service 2>/dev/null || true
+systemctl disable it-aman.service 2>/dev/null || true
+
+# ── 3. Download files from GitHub ──
+echo "[3/7] Downloading IT Aman files..."
 mkdir -p "$INSTALL_DIR/src"
 
 BASE_URL="https://raw.githubusercontent.com/$REPO/$BRANCH"
@@ -51,13 +56,13 @@ chmod +x "$INSTALL_DIR/src/gui.py"
 
 echo "  Downloaded to $INSTALL_DIR"
 
-# ── 3. Create directories ──
-echo "[3/7] Creating directories..."
+# ── 4. Create directories ──
+echo "[4/7] Creating directories..."
 mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$SOCKET_DIR"
 
-# ── 4. Create systemd service ──
-echo "[4/7] Installing systemd service..."
-cat > "$SERVICE_FILE" << SERVICE_EOF
+# ── 5. Create systemd service ──
+echo "[5/7] Installing systemd service..."
+cat > "$SERVICE_FILE" << 'SERVICE_EOF'
 [Unit]
 Description=IT Aman Printer Daemon
 After=network.target cups.service
@@ -66,8 +71,8 @@ Requires=cups.service
 [Service]
 Type=forking
 PIDFile=/run/it-aman/it-aman.pid
-ExecStart=/usr/bin/python3 $INSTALL_DIR/src/daemon.py
-ExecStop=/bin/kill -TERM \$MAINPID
+ExecStart=/usr/bin/python3 /opt/it-aman/src/daemon.py
+ExecStop=/bin/kill -TERM $MAINPID
 Restart=on-failure
 RestartSec=5
 
@@ -75,39 +80,40 @@ RestartSec=5
 WantedBy=multi-user.target
 SERVICE_EOF
 
-# ── 5. Create desktop shortcut ──
-echo "[5/7] Creating desktop shortcut..."
-cat > "$DESKTOP_FILE" << DESKTOP_EOF
+# ── 6. Create desktop shortcut ──
+echo "[6/7] Creating desktop shortcut..."
+cat > "$DESKTOP_FILE" << 'DESKTOP_EOF'
 [Desktop Entry]
 Name=IT Aman Printer Tool
 Name[ar]=أداة إدارة الطابعات
 Comment=Printer management tool
 Comment[ar]=أداة إدارة الطابعات
-Exec=sudo python3 $INSTALL_DIR/src/gui.py
+Exec=sudo python3 /opt/it-aman/src/gui.py
 Icon=printer
 Terminal=false
 Type=Application
 Categories=System;Settings;
 DESKTOP_EOF
 
-# ── 6. Enable and start daemon ──
-echo "[6/7] Enabling and starting daemon..."
+# ── 7. Enable and start daemon ──
+echo "[7/7] Enabling and starting daemon..."
 systemctl daemon-reload
 systemctl enable it-aman.service
 systemctl restart it-aman.service
 
-# ── 7. Verify ──
-echo "[7/7] Verifying installation..."
+# ── Verify ──
 sleep 2
 
 if systemctl is-active --quiet it-aman.service; then
     echo ""
-    echo "✅ IT Aman Printer Tool v3.4 installed successfully!"
+    echo "✅ IT Aman Printer Tool v3.6 installed successfully!"
     echo ""
     echo "  Daemon: ACTIVE (running in background)"
     echo "  Socket: $SOCKET_DIR/it-aman.sock"
     echo "  Config: $CONFIG_DIR/config.json"
     echo "  Log:    $LOG_DIR/daemon.log"
+    echo ""
+    echo "  Auto-update: ENABLED (checks every 60 seconds)"
     echo ""
     echo "To open the GUI:"
     echo "  sudo python3 $INSTALL_DIR/src/gui.py"
