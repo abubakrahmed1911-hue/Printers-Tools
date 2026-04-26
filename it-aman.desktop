@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=IT Aman Printer Tool
+Name[ar]=أداة إدارة الطابعات
+Comment=Printer management and diagnostic tool
+Comment[ar]=أداة إدارة وتشخيص الطابعات
+Exec=pkexec /usr/bin/python3 /opt/it-aman/src/gui.py
+Icon=printer
+Terminal=false
+Type=Application
+Categories=System;Settings;HardwareSettings;
+Keywords=printer;CUPS;driver;thermal;network;
+StartupNotify=true
