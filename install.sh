@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
-# IT Aman Printer Tool v3.11 — Installation Script
+# IT Aman Printer Tool v3.12 — Installation Script
 # ═══════════════════════════════════════════════════════════
 
 set -e
@@ -17,7 +17,7 @@ POLICY_FILE="/usr/share/polkit-1/actions/com.it-aman.gui.policy"
 SUDOERS_FILE="/etc/sudoers.d/it-aman-gui"
 
 echo "========================================"
-echo " IT Aman Printer Tool v3.11 Installer"
+echo " IT Aman Printer Tool v3.12 Installer"
 echo "========================================"
 echo ""
 
@@ -28,19 +28,19 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # ── 1. Install dependencies ──
-echo "[1/9] Installing dependencies..."
+echo "[1/10] Installing dependencies..."
 apt-get update -qq
 apt-get install -y -qq python3 python3-gi python3-gi-cairo gir1.2-gtk-3.0 \
     cups cups-bsd avahi-daemon avahi-utils \
     curl wget policykit-1 2>/dev/null || true
 
 # ── 2. Stop old service if running ──
-echo "[2/9] Stopping old service (if any)..."
+echo "[2/10] Stopping old service (if any)..."
 systemctl stop it-aman.service 2>/dev/null || true
 systemctl disable it-aman.service 2>/dev/null || true
 
 # ── 3. Download files from GitHub ──
-echo "[3/9] Downloading IT Aman files..."
+echo "[3/10] Downloading IT Aman files..."
 mkdir -p "$INSTALL_DIR/src"
 
 BASE_URL="https://raw.githubusercontent.com/$REPO/$BRANCH"
@@ -49,6 +49,7 @@ curl -sL "$BASE_URL/src/daemon.py" -o "$INSTALL_DIR/src/daemon.py"
 curl -sL "$BASE_URL/src/gui.py" -o "$INSTALL_DIR/src/gui.py"
 curl -sL "$BASE_URL/version.json" -o "$INSTALL_DIR/version.json"
 curl -sL "$BASE_URL/public.pem" -o "$INSTALL_DIR/public.pem"
+curl -sL "$BASE_URL/printer_definitions.json" -o "$INSTALL_DIR/printer_definitions.json"
 curl -sL "$BASE_URL/.gitignore" -o "$INSTALL_DIR/.gitignore"
 curl -sL "$BASE_URL/CHANGELOG.md" -o "$INSTALL_DIR/CHANGELOG.md"
 
@@ -59,11 +60,20 @@ chmod +x "$INSTALL_DIR/src/gui.py"
 echo "  Downloaded to $INSTALL_DIR"
 
 # ── 4. Create directories ──
-echo "[4/9] Creating directories..."
+echo "[4/10] Creating directories..."
 mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$SOCKET_DIR"
 
-# ── 5. Create systemd service ──
-echo "[5/9] Installing systemd service..."
+# ── 5. Sync centralized printer definitions ──
+echo "[5/10] Syncing centralized printer definitions..."
+if [ -f "$INSTALL_DIR/printer_definitions.json" ]; then
+    cp "$INSTALL_DIR/printer_definitions.json" "$CONFIG_DIR/printer_definitions.json"
+    echo "  ✓ Printer definitions synced to $CONFIG_DIR"
+else
+    echo "  ⚠ printer_definitions.json not found — skipping"
+fi
+
+# ── 6. Create systemd service ──
+echo "[6/10] Installing systemd service..."
 cat > "$SERVICE_FILE" << 'SERVICE_EOF'
 [Unit]
 Description=IT Aman Printer Daemon
@@ -82,8 +92,8 @@ RestartSec=5
 WantedBy=multi-user.target
 SERVICE_EOF
 
-# ── 6. Install Polkit policy (allows GUI without password) ──
-echo "[6/9] Installing Polkit policy..."
+# ── 7. Install Polkit policy (allows GUI without password) ──
+echo "[7/10] Installing Polkit policy..."
 mkdir -p /usr/share/polkit-1/actions/
 curl -sL "$BASE_URL/com.it-aman.gui.policy" -o "$POLICY_FILE" 2>/dev/null || true
 if [ -f "$POLICY_FILE" ]; then
@@ -92,14 +102,14 @@ else
     echo "  ⚠ Polkit policy not downloaded — will use sudoers fallback"
 fi
 
-# ── 7. Add sudoers entry (passwordless sudo for GUI) ──
-echo "[7/9] Setting up passwordless sudo for GUI..."
+# ── 8. Add sudoers entry (passwordless sudo for GUI) ──
+echo "[8/10] Setting up passwordless sudo for GUI..."
 echo "%users ALL=(root) NOPASSWD: /usr/bin/python3 $INSTALL_DIR/src/gui.py" > "$SUDOERS_FILE"
 chmod 440 "$SUDOERS_FILE"
 echo "  ✓ Sudoers rule installed"
 
-# ── 8. Create desktop shortcut ──
-echo "[8/9] Creating desktop shortcut..."
+# ── 9. Create desktop shortcut ──
+echo "[9/10] Creating desktop shortcut..."
 
 # Use pkexec if polkit is available, otherwise sudo
 if [ -f "$POLICY_FILE" ]; then
@@ -149,8 +159,8 @@ fi
 update-desktop-database /usr/share/applications/ 2>/dev/null || true
 echo "  ✓ Desktop shortcut installed"
 
-# ── 9. Enable and start daemon ──
-echo "[9/9] Enabling and starting daemon..."
+# ── 10. Enable and start daemon ──
+echo "[10/10] Enabling and starting daemon..."
 systemctl daemon-reload
 systemctl enable it-aman.service
 systemctl restart it-aman.service
@@ -161,14 +171,16 @@ sleep 2
 if systemctl is-active --quiet it-aman.service; then
     echo ""
     echo "╔══════════════════════════════════════════════════╗"
-    echo "║  ✅ IT Aman Printer Tool v3.11 installed!       ║"
+    echo "║  ✅ IT Aman Printer Tool v3.12 installed!       ║"
     echo "╠══════════════════════════════════════════════════╣"
     echo "║  Daemon: ACTIVE (running in background)         ║"
     echo "║  Socket: $SOCKET_DIR/it-aman.sock"
     echo "║  Config: $CONFIG_DIR/config.json"
+    echo "║  Defs:   $CONFIG_DIR/printer_definitions.json"
     echo "║  Log:    $LOG_DIR/daemon.log"
     echo "║                                                  ║"
-    echo "║  Auto-update: ENABLED (checks every 5 minutes)  ║"
+    echo "║  Auto-update: ENABLED (checks every minute)     ║"
+    echo "║  Centralized definitions: ENABLED               ║"
     echo "║                                                  ║"
     echo "║  To open the GUI (pick one):                     ║"
     echo "║  • Double-click desktop shortcut                 ║"
