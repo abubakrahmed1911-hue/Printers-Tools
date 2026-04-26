@@ -57,7 +57,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "3.8"
+VERSION = "3.9"
 
 # Paths
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
@@ -139,6 +139,7 @@ ALLOWED_COMMANDS = {
     "list_printers",
     "repair_printer",
     "update",
+    "define_driver",
 }
 
 # ---------------------------------------------------------------------------
@@ -1394,6 +1395,159 @@ def _install_sprt() -> dict:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+# ---- handle_repair_printer (repair a SPECIFIC printer) --------------------
+
+def handle_repair_printer(params: dict) -> dict:
+    """
+    Repair a SPECIFIC printer by name:
+      1. Enable it via cupsenable + cupsaccept
+      2. Clear its job queue (cancel -a NAME)
+      3. If it's disabled, re-enable it
+      4. Verify it's now accepting jobs
+
+    This is different from handle_fix (smart diagnostic) which runs a
+    general check on all printers.  The GUI "Repair" button calls this.
+    """
+    name = params.get("name", "").strip()
+    if not name:
+        return {"status": "error", "message": "Printer name is required"}
+
+    actions = []
+
+    # Step 1: Check if printer exists
+    if not is_printer_exists(name):
+        return {"status": "error", "message": f"Printer '{name}' does not exist in CUPS"}
+
+    # Step 2: Enable the printer (cupsenable + cupsaccept)
+    rc1, _, err1 = run_cmd(["cupsenable", name])
+    if rc1 == 0:
+        actions.append(f"Enabled printer '{name}'")
+        log.info("Enabled printer: %s", name)
+    else:
+        actions.append(f"cupsenable failed for '{name}': {err1}")
+        log.warning("cupsenable failed for %s: %s", name, err1)
+
+    rc2, _, err2 = run_cmd(["cupsaccept", name])
+    if rc2 == 0:
+        actions.append(f"Printer '{name}' now accepting jobs")
+        log.info("cupsaccept for %s", name)
+    else:
+        actions.append(f"cupsaccept failed for '{name}': {err2}")
+        log.warning("cupsaccept failed for %s: %s", name, err2)
+
+    # Step 3: Clear stuck jobs for this printer only
+    rc3, _, err3 = run_cmd(["cancel", "-a", name])
+    if rc3 == 0:
+        actions.append(f"Cleared all jobs on '{name}'")
+        log.info("Cleared jobs on %s", name)
+    else:
+        actions.append(f"No stuck jobs to clear on '{name}'")
+
+    # Step 4: Verify printer state
+    rc4, out4, _ = run_cmd(["lpstat", "-p", name])
+    if rc4 == 0 and out4:
+        if "enabled" in out4.lower():
+            actions.append(f"Printer '{name}' is now ENABLED and ready")
+        elif "disabled" in out4.lower():
+            # Force re-enable
+            run_cmd(["cupsenable", name])
+            run_cmd(["cupsaccept", name])
+            actions.append(f"Force re-enabled printer '{name}'")
+            log.info("Force re-enabled %s", name)
+    else:
+        actions.append(f"Could not verify state of '{name}'")
+
+    # Step 5: Restart CUPS if printer still not working
+    # This is a safety net — only if the above didn't help
+    rc5, out5, _ = run_cmd(["lpstat", "-p", name])
+    if rc5 == 0 and "disabled" in out5.lower():
+        log.warning("Printer %s still disabled after enable — restarting CUPS", name)
+        cups_restart()
+        time.sleep(2)
+        run_cmd(["cupsenable", name])
+        run_cmd(["cupsaccept", name])
+        actions.append("Restarted CUPS and re-enabled printer")
+
+    log.info("Repair complete for printer '%s'", name)
+    return {"status": "ok", "actions": actions, "printer": name}
+
+
+# ---- handle_define_driver (install PPD driver for a printer) ---------------
+
+def handle_define_driver(params: dict) -> dict:
+    """
+    Define/install a driver (PPD) for an existing printer.
+    Params:
+      - name: printer name
+      - model: model name to search for PPD
+    Steps:
+      1. Search for matching PPD via lpinfo -m
+      2. Apply the PPD to the printer with lpadmin -p NAME -m PPD
+      3. Enable and accept
+    """
+    name = params.get("name", "").strip()
+    model = params.get("model", "").strip()
+
+    if not name:
+        return {"status": "error", "message": "Printer name is required"}
+
+    if not is_printer_exists(name):
+        return {"status": "error", "message": f"Printer '{name}' does not exist in CUPS"}
+
+    actions = []
+    search_model = model or name
+
+    # Step 1: Find matching PPD
+    log.info("Searching PPD for printer '%s' model '%s'", name, search_model)
+    ppd = find_ppd_for_model(search_model)
+
+    if not ppd:
+        # Try IPP Everywhere as fallback
+        log.info("No specific PPD found — trying IPP Everywhere")
+        rc, _, err = run_cmd(
+            ["lpadmin", "-p", name, "-m", "everywhere"],
+            timeout=30,
+        )
+        if rc == 0:
+            actions.append(f"Set IPP Everywhere driver for '{name}'")
+        else:
+            # Try raw driver
+            rc2, _, err2 = run_cmd(
+                ["lpadmin", "-p", name, "-m", "raw"],
+                timeout=30,
+            )
+            if rc2 == 0:
+                actions.append(f"Set raw driver for '{name}' (no PPD)")
+            else:
+                return {
+                    "status": "error",
+                    "message": f"No driver found for '{search_model}' and fallback drivers also failed",
+                    "actions": actions,
+                }
+    else:
+        # Step 2: Apply the PPD
+        log.info("Found PPD: %s — applying to %s", ppd, name)
+        rc, _, err = run_cmd(
+            ["lpadmin", "-p", name, "-m", ppd],
+            timeout=30,
+        )
+        if rc == 0:
+            actions.append(f"Installed driver PPD: {ppd}")
+        else:
+            return {
+                "status": "error",
+                "message": f"Failed to install PPD '{ppd}': {err}",
+                "actions": actions,
+            }
+
+    # Step 3: Enable and accept
+    run_cmd(["cupsenable", name])
+    run_cmd(["cupsaccept", name])
+    actions.append(f"Printer '{name}' enabled and accepting jobs")
+
+    return {"status": "ok", "actions": actions, "printer": name}
+
+
 # ---- handle_remove_printer ------------------------------------------------
 
 def handle_remove_printer(params: dict) -> dict:
@@ -1451,21 +1605,36 @@ def handle_quick_fix_spooler(params: dict) -> dict:
     else:
         actions.append("CUPS restart failed -- will try to continue")
 
-    # Step 2: Cancel all stuck jobs
-    rc, out, _ = run_cmd(["cancel", "-a"])
-    if rc == 0:
-        actions.append("Cancelled all stuck print jobs")
+    # Step 2: Cancel only STUCK jobs (held/error state), not ALL jobs
+    # Using cancel -a -x removes ALL completed jobs too which is too aggressive
+    # Instead, find held/stuck jobs and cancel only those
+    rc, out, _ = run_cmd(["lpstat", "-o"])
+    if rc == 0 and out:
+        stuck_count = 0
+        for line in out.splitlines():
+            parts = line.strip().split()
+            if parts:
+                # Each line: "printer-name-123  user  size  date"
+                job_id = parts[0]
+                # Cancel individual stuck jobs
+                rc_cancel, _, _ = run_cmd(["cancel", job_id])
+                if rc_cancel == 0:
+                    stuck_count += 1
+        if stuck_count > 0:
+            actions.append(f"Cancelled {stuck_count} stuck print job(s)")
+        else:
+            actions.append("No stuck print jobs found")
     else:
-        actions.append("No stuck jobs to cancel (or cancel failed)")
+        actions.append("No print jobs in queue")
 
-    # Step 3: Ensure CUPS is running
+    # Step 3: Ensure CUPS is running (but do NOT cancel all jobs)
     if not cups_is_running():
         log.warning("CUPS not running after restart -- attempting start")
         if cups_start():
             actions.append("CUPS started")
         else:
-            # CUPS won't start -- last resort: clear spool and try again
-            actions.append("CUPS failed to start -- clearing spool as last resort")
+            # CUPS won't start -- last resort: clear only spool temp files, NOT active jobs
+            actions.append("CUPS failed to start -- cleaning spool temp files")
 
             spool_dir = "/var/spool/cups"
             try:
@@ -2270,6 +2439,8 @@ HANDLERS = {
     "fix": handle_fix,
     "scan": handle_scan,
     "remove_printer": handle_remove_printer,
+    "repair_printer": handle_repair_printer,
+    "define_driver": handle_define_driver,
     "quick_fix_spooler": handle_quick_fix_spooler,
     "network_scan": handle_network_scan,
     "setup_printer": handle_setup_printer,
@@ -2293,7 +2464,6 @@ ACTION_ALIASES = {
     "fix_spooler": "quick_fix_spooler",
     "detect_usb_printer": "detect_usb_printers",
     "list_printers": "discover_printers",
-    "repair_printer": "fix",
     "update": "update_all",
 }
 

@@ -22,7 +22,7 @@ import subprocess
 
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
 CONFIG_PATH = "/etc/it-aman/config.json"
-APP_VERSION = "3.8"
+APP_VERSION = "3.9"
 APP_NAME = "IT Aman - Printer Support Tool"
 DEVELOPER = "Developed by: IT Helpdesk Operation"
 
@@ -582,6 +582,7 @@ class DaemonClient:
         """Send a JSON command to the daemon and return the response dict.
         Protocol: newline-delimited JSON (send payload + \\n, receive until \\n).
         """
+        sock = None
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.settimeout(timeout)
@@ -598,7 +599,6 @@ class DaemonClient:
                 data += chunk
                 if b"\n" in data:
                     break
-            sock.close()
             text = data.decode("utf-8").strip()
             if not text:
                 return {"status": "error", "message": "Empty response from daemon"}
@@ -613,6 +613,12 @@ class DaemonClient:
             return {"status": "error", "message": f"Invalid response: {e}"}
         except Exception as e:
             return {"status": "error", "message": str(e)}
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
 
     def send_threaded(self, command_dict, callback, timeout=30):
         """Send command in a background thread; invoke callback via GLib.idle_add."""
@@ -2246,8 +2252,9 @@ class ITAmanApp(Gtk.Window):
         self._update_available_version = None
         self._update_dismissed_version = None  # track dismissed updates so we don't re-show
 
-        # Background update check: first after 3s, then every 60s
-        GLib.timeout_add_seconds(3, self._periodic_update_check)
+        # Background update check: first after 5s, then every 300s (5 min)
+        # Don't check too frequently to avoid performance issues
+        GLib.timeout_add_seconds(5, self._periodic_update_check)
 
     # ── setup ──
 
@@ -2413,9 +2420,11 @@ class ITAmanApp(Gtk.Window):
     # ── update check ──
 
     def _periodic_update_check(self):
-        """Check for updates every 60 seconds. Show banner if update found."""
+        """Check for updates every 5 minutes. Show banner if update found."""
         self.daemon.send_threaded({"action": "check_update"}, self._on_update_check_result, timeout=15)
-        return True  # keep the timer running
+        # Re-schedule check every 5 minutes (300 seconds)
+        GLib.timeout_add_seconds(300, self._periodic_update_check)
+        return False  # Don't auto-repeat; we re-schedule manually
 
     def _on_update_check_result(self, result):
         if result.get("status") == "ok":
