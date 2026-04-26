@@ -1,0 +1,26 @@
+{
+  "files": [
+    {
+      "path": "src/daemon.py",
+      "sha256": "2b93c075fb00928dc05366a3d98894501fc85655b4e254edd887ad81056a2265"
+    },
+    {
+      "path": "src/gui.py",
+      "sha256": "3eced11eb68711f456a6e75f433d267c5db29f35f8003d7fb6d162c4648a0237"
+    },
+    {
+      "path": "version.json",
+      "sha256": "270fd6795e3d189c57b6ce02816e8d28ea831cd4602713b3e615d47728143f5c"
+    },
+    {
+      "path": "public.pem",
+      "sha256": "bbe146e5f5050f3aaa19e9f80de5d133f95fe37f34a22e6ffb3efeb5e02db965"
+    },
+    {
+      "path": ".gitignore",
+      "sha256": "458ce643832e42c98c00d251f12eee048e6a58e057cc35ffa957b6c29a23f6dd"
+    }
+  ],
+  "signature": "/Hh1aSMjWHtb76DC56Gy7opcoC9JcGJJ5SNlI2qWP1QHPwqDB03VTBH3xSey63Q8TVilHBaFwb3pSvxQ9qzFAQ==",
+  "public_key": "DUFmG4LL3vPY22vUOs3ugFx3lpsIewW+TrY7zJmP0wM="
+}
