@@ -1,32 +1,32 @@
-# IT Aman v3.3 — Full Printers-Tools Merge
+# IT Aman Changelog
 
-## ✅ اللي اتضاف من Printers-Tools v1.3
+## v3.4 — Major Refactor
 
-### إضافة طابعة شبكة
-- زر "فحص الشبكة" في شاشة Setup
-- TCP scan على 631/9100 + mDNS + HTTP probe لاكتشاف الموديل
-- تحميل وتثبيت Kyocera kyodialog.deb تلقائياً لو مش موجود
-- إعداد InputSlot=One + Duplex=None تلقائياً بعد التثبيت
+### Fixed
+- Language switching no longer freezes the UI (selected at startup only)
+- GITHUB_REPO corrected to Printers-Tools
+- Update system works without GitHub token (public repo)
 
-### حذف طابعة
-- زر "حذف طابعة" في Setup
-- cancel + cupsdisable + lpadmin -x مع تأكيد
+### Improved
+- Network printer: IPP Everywhere tried first (no driver needed), then LPD fallback
+- Thermal printer: 5-step wizard with brand image cards
+- Removed branch system (unnecessary complexity)
+- Removed data.json dependency
+- Cleaner CSS design with RTL support
+- All daemon communication is threaded (no UI freezes)
 
-### الطابعة الحرارية — برندات
-- X-Printer XP-80: تحميل binary → تشغيل installer → PPD → lpadmin
-- SPRT 80mm: تحميل zip → install.sh → rastertoprinter filter → PPD (FullCut) → lpadmin
+### Security
+- No token stored in script
+- Ed25519 manifest verification for updates
+- private.pem excluded via .gitignore
 
-### إصلاح الطباعة العامة
-- "إصلاح سريع لنظام الطباعة" في القائمة الرئيسية
-- stop CUPS + rm /var/spool/cups/* + start CUPS
+## v3.3 — Initial Python Port
+- Ported from bash script to Python GTK3
+- Added daemon + GUI architecture
+- Added branch management
+- Added Ed25519 signing
 
-## ✅ ثوابت النظام (محتفظ بها)
-- توقيع Ed25519 + SHA256 على كل تحديث
-- Daemon/GUI منفصلين (Unix socket)
-- Public key مدمج في الكود — private key عند المطور فقط
-- Scan cache 30 ثانية
-
-## طريقة النشر بعد أي تعديل
-```
-release.bat 3.3
-```
+## v1.3 — Final Bash Version
+- Original bash + zenity script
+- Network scan + Kyocera + XP-80 + SPRT support
+- Token-based GitHub updates
