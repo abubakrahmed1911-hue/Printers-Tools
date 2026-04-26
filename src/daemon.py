@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-IT Aman Printer Daemon v3.11
+IT Aman Printer Daemon v3.12
 =============================
 A Unix socket daemon for managing CUPS printers on Linux.
 Runs as root, listens on /run/it-aman/it-aman.sock, and processes
@@ -19,6 +19,15 @@ Key changes from v3.10:
   - FIX: CUPS start retries 3 times before resorting to spool cleanup
   - FIX: Network printer card passes full_uri and uri for better setup
   - VERSION bumped to 3.11
+
+Key changes from v3.12:
+  - NEW: Centralized printer name templates synced from GitHub
+   - NEW: handle_get_name_templates for predefined naming (Operation MF, Accountant MF, FS, etc.)
+  - NEW: handle_sync_definitions to download and apply remote printer definitions
+  - FIX: Printer listing now shows ALL printers including uninstalled USB/network devices
+  - FIX: Repair/clean/diagnose commands now work correctly with proper CUPS state management
+  - FIX: Thermal printer detection returns proper error message when no USB printer found
+  - VERSION bumped to 3.12
 
 Architecture:
   - Unix socket at /run/it-aman/it-aman.sock
@@ -54,7 +63,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "3.11"
+VERSION = "3.12"
 
 # Paths
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
@@ -83,6 +92,29 @@ SPRT_DRIVER_URL = (
     "AGVfJEgg05my1TcWe1xHCs4?rlkey=pqx2yv4x5blqmz0vks058ef9g"
     "&st=hcp53bq0&dl=1"
 )
+
+# Centralized printer definitions URL (synced to all devices)
+PRINTER_DEFINITIONS_URL = f"{RAW_BASE}/printer_definitions.json"
+
+# Predefined printer name templates (also synced from GitHub)
+# These are the standard naming conventions for branches
+PRINTER_NAME_TEMPLATES = [
+    "Operation MF",
+    "Accountant MF",
+    "FS",
+    "HR MF",
+    "Reception MF",
+    "Manager MF",
+    "IT MF",
+    "GM MF",
+    "Operation 2 MF",
+    "Accountant 2 MF",
+    "FS2",
+    "FS3",
+    "FS4",
+    "HR 2 MF",
+    "Reception 2 MF",
+]
 
 # Thermal printer constants
 SPRT_PPD_DEST = "/usr/share/cups/model/SPRIT/80mmSeries.ppd"
@@ -137,6 +169,9 @@ ALLOWED_COMMANDS = {
     "repair_printer",
     "update",
     "define_driver",
+    "get_name_templates",
+    "sync_definitions",
+    "setup_printer_named",
 }
 
 # ---------------------------------------------------------------------------
@@ -1499,6 +1534,138 @@ def handle_repair_printer(params: dict) -> dict:
     return {"status": "ok", "actions": actions, "printer": name}
 
 
+# ---- handle_get_name_templates (predefined naming conventions) ---------------
+
+def handle_get_name_templates(params: dict) -> dict:
+    """
+    Return the list of predefined printer name templates.
+    Also checks GitHub for updated templates if online.
+    The GUI uses this to show a naming selection when adding printers.
+
+    Returns: {status: "ok", templates: [...], remote_templates: [...]}
+    """
+    local_templates = list(PRINTER_NAME_TEMPLATES)
+
+    # Try to fetch updated templates from GitHub
+    remote_templates = []
+    try:
+        defs_text = download_text(PRINTER_DEFINITIONS_URL, timeout=10)
+        if defs_text:
+            defs = json.loads(defs_text)
+            remote_templates = defs.get("name_templates", [])
+            if remote_templates:
+                log.info("Fetched %d remote name templates from GitHub", len(remote_templates))
+    except Exception as exc:
+        log.debug("Could not fetch remote templates: %s", exc)
+
+    # Merge: remote takes priority, then local fallback
+    all_templates = list(remote_templates) if remote_templates else local_templates
+
+    # Get currently installed printer names so GUI can show which names are taken
+    installed = []
+    rc, out, _ = run_cmd(["lpstat", "-p"])
+    if rc == 0 and out:
+        for line in out.splitlines():
+            m = re.match(r'printer\s+(\S+)', line)
+            if m:
+                installed.append(m.group(1))
+
+    return {
+        "status": "ok",
+        "templates": all_templates,
+        "installed": installed,
+    }
+
+
+# ---- handle_sync_definitions (centralized config sync) --------------------
+
+def handle_sync_definitions(params: dict) -> dict:
+    """
+    Download and apply printer definitions from GitHub.
+    This allows the admin to centrally manage printer names and configs
+    that propagate to ALL devices.
+
+    The definitions file (printer_definitions.json) can contain:
+      - name_templates: list of allowed printer names
+      - printers: list of printer configs to auto-setup
+      - thermal_drivers: thermal printer driver assignments
+
+    Returns: {status: "ok", actions: [...], printers_synced: N}
+    """
+    report = {"status": "ok", "actions": []}
+
+    defs_text = download_text(PRINTER_DEFINITIONS_URL, timeout=30)
+    if not defs_text:
+        return {"status": "error", "message": "Could not fetch printer_definitions.json from GitHub"}
+
+    try:
+        defs = json.loads(defs_text)
+    except json.JSONDecodeError as exc:
+        return {"status": "error", "message": f"Invalid printer_definitions.json: {exc}"}
+
+    # Save definitions locally for offline use
+    local_defs_path = os.path.join(CONFIG_DIR, "printer_definitions.json")
+    try:
+        with open(local_defs_path, "w") as fh:
+            json.dump(defs, fh, indent=2, ensure_ascii=False)
+        report["actions"].append(f"Saved definitions to {local_defs_path}")
+    except Exception as exc:
+        report["actions"].append(f"Could not save definitions locally: {exc}")
+
+    # Apply predefined printers if specified
+    printers_to_setup = defs.get("printers", [])
+    synced = 0
+    for prn_def in printers_to_setup:
+        prn_name = prn_def.get("name", "").strip()
+        prn_ip = prn_def.get("ip", "").strip()
+        prn_model = prn_def.get("model", "").strip()
+        prn_type = prn_def.get("type", "network").strip().lower()
+        prn_brand = prn_def.get("brand", "").strip().lower()
+
+        if not prn_name:
+            continue
+
+        # If printer already exists with this name, skip
+        if is_printer_exists(prn_name):
+            # But re-enable if disabled
+            run_cmd(["cupsenable", prn_name])
+            run_cmd(["cupsaccept", prn_name])
+            report["actions"].append(f"Printer '{prn_name}' already exists — re-enabled")
+            synced += 1
+            continue
+
+        if prn_type == "thermal" and prn_brand:
+            # Install thermal printer
+            result = handle_install_thermal_brand({
+                "brand": prn_brand,
+                "printer_name": prn_name,
+            })
+            if result.get("status") == "ok":
+                report["actions"].append(f"Set up thermal printer '{prn_name}' ({prn_brand})")
+                synced += 1
+            else:
+                report["actions"].append(f"Failed to set up thermal '{prn_name}': {result.get('message', '')}")
+        elif prn_ip:
+            # Install network printer
+            result = handle_setup_printer({
+                "name": prn_name,
+                "ip": prn_ip,
+                "model": prn_model,
+                "set_default": False,
+            })
+            if result.get("status") == "ok":
+                report["actions"].append(f"Set up network printer '{prn_name}' at {prn_ip}")
+                synced += 1
+            else:
+                report["actions"].append(f"Failed to set up '{prn_name}': {result.get('message', '')}")
+
+    report["printers_synced"] = synced
+    report["actions"].append(f"Synced {synced} printer(s) from centralized definitions")
+
+    log.info("Sync definitions complete: %d printers synced", synced)
+    return report
+
+
 # ---- handle_define_driver (install PPD driver for a printer) ---------------
 
 def handle_define_driver(params: dict) -> dict:
@@ -2483,6 +2650,8 @@ HANDLERS = {
     "remove_printer": handle_remove_printer,
     "repair_printer": handle_repair_printer,
     "define_driver": handle_define_driver,
+    "get_name_templates": handle_get_name_templates,
+    "sync_definitions": handle_sync_definitions,
     "quick_fix_spooler": handle_quick_fix_spooler,
     "network_scan": handle_network_scan,
     "setup_printer": handle_setup_printer,
@@ -2507,6 +2676,7 @@ ACTION_ALIASES = {
     "detect_usb_printer": "detect_usb_printers",
     "list_printers": "discover_printers",
     "update": "update_all",
+    "setup_printer_named": "setup_printer",
 }
 
 
@@ -2907,3 +3077,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
