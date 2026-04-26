@@ -2,25 +2,25 @@
   "files": [
     {
       "path": "src/daemon.py",
-      "sha256": "3cc326ade57a5f80d7fe9fb31f61628489271d1570f562ff5917d45a073292f3"
+      "sha256": "4c200f504478fdb2cc4ea8cfbe864f6b042dc61823e7f4b6a27b9eed8236d840"
     },
     {
       "path": "src/gui.py",
-      "sha256": "589721c51e202b4bbdae7d7c1dd34f40639f11070ed7f5567995c2927ca56843"
+      "sha256": "14795ce32f2b500ad5b0cffc28645620da5ecb5ae6ae2535beb54d197b17530a"
     },
     {
       "path": "version.json",
-      "sha256": "6f20a3313883741b13858b32f9f1794bedc637d1862ff7567124a05d5aabaaed"
+      "sha256": "509110964df785a6f77c44a22b72df88aedd2e0efc38da49d5b855381c0456fc"
     },
     {
       "path": "public.pem",
-      "sha256": "cc8bce6ab95ddfe3a084320d266adeb8ee13f62390e311fff9e51cccc04c0d59"
+      "sha256": "038797f171f70658b49074f9f10e1f81d6166e598b5725d2bcceaa7d940f2084"
     },
     {
       "path": ".gitignore",
-      "sha256": "1f29ddbc3213ff88e4448655af9c4c4f9baaf72e7e38852fe077b6a63a004137"
+      "sha256": "458ce643832e42c98c00d251f12eee048e6a58e057cc35ffa957b6c29a23f6dd"
     }
   ],
-  "signature": "lvAiP2sUIDzi2wIczuD6klrH+JAS9cP6WPk7UGxR44fdLSZCoPjBh1YzgfP3VD/M2QF8pzoEBgnDzmASF3P4Cw==",
-  "public_key": "bBtrjHKyIelY2EBlxcdEfskgEXeXyxHVxUoz/WyIR5U="
+  "signature": "fXLRQ0gAdICWGV6T1UKjdyfTTUmx7wU6F0FLkeWL9naeJ13jrJ4hAJWg9RBkfTVA9DABVqK7NcNgKUDyB4KmAA==",
+  "public_key": "zxTR7vN7LGtHexrB7p2ldzSUCRvc25AOesbsRj6wY+8="
 }
