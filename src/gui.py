@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IT Aman Printer Support Tool v3.10 — GTK3 Frontend
+IT Aman Printer Support Tool v3.11 — GTK3 Frontend
 
 Communicates with it-aman daemon via Unix socket.
 Language is selected once at startup and locked for the session.
 No branch selection — works directly with network printers.
 Developed by IT Helpdesk Operation.
 
-Key fixes in v3.10:
-  - Fixed USB thermal printer detection check in wizard step 3
-  - Fixed pulse_loop to stop when progress bar is destroyed
-  - Fixed update notification to use proper version comparison
+Key fixes in v3.11:
+  - CRITICAL FIX: pulse_loop timer leak causing GUI freeze (was creating
+    new GLib.timeout_add each cycle instead of returning True for auto-repeat)
+  - CRITICAL FIX: Network printer card now passes URI when IP is missing,
+    so printers without a direct IP can still be added
+  - CRITICAL FIX: Printer name defaults to model or IP-based name instead
+    of "Unknown" which would fail lpadmin
+  - FIX: Increased timeouts for network scan and driver installation
+  - FIX: USB detection result timeout added
+  - VERSION bumped to 3.11
 """
 
 import gi
@@ -28,7 +34,7 @@ import subprocess
 
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
 CONFIG_PATH = "/etc/it-aman/config.json"
-APP_VERSION = "3.10"
+APP_VERSION = "3.11"
 APP_NAME = "IT Aman - Printer Support Tool"
 DEVELOPER = "Developed by: IT Helpdesk Operation"
 
@@ -671,13 +677,16 @@ def icon_button(icon_name, label_text, css_class="btn-primary"):
 
 
 def pulse_loop(progress_bar):
-    """Repeatedly pulse a progress bar until the bar is destroyed or hidden."""
+    """Repeatedly pulse a progress bar until the bar is destroyed or hidden.
+    IMPORTANT: Must return True so GLib auto-repeats the timer.
+    Do NOT call GLib.timeout_add inside — that causes exponential timer leak!
+    Start with: GLib.timeout_add(100, pulse_loop, progress_bar)
+    """
     try:
         if not progress_bar.get_realized():
             return False
         progress_bar.pulse()
-        GLib.timeout_add(100, pulse_loop, progress_bar)
-        return True
+        return True  # GLib will auto-repeat — do NOT add another timeout_add
     except Exception:
         return False
 
@@ -956,7 +965,7 @@ class DiagnosticScreen(Gtk.Box):
         self.pack_start(self.results_box, False, False, 0)
 
         # Start pulse & request
-        pulse_loop(self.progress)
+        GLib.timeout_add(100, pulse_loop, self.progress)
         self.app.daemon.send_threaded({"action": "diagnose"}, self._on_result)
 
     def _on_result(self, result):
@@ -1075,10 +1084,10 @@ class NetworkPrinterScreen(Gtk.Box):
         self.scan_btn.set_sensitive(False)
         self.scan_status.set_text(t("net_scanning", lang))
         self.scan_spinner.start()
-        pulse_loop(self.scan_progress)
+        GLib.timeout_add(100, pulse_loop, self.scan_progress)
         for child in self.results_box.get_children():
             self.results_box.remove(child)
-        self.app.daemon.send_threaded({"action": "scan_network"}, self._on_scan_result)
+        self.app.daemon.send_threaded({"action": "scan_network"}, self._on_scan_result, timeout=90)
 
     def _on_scan_result(self, result):
         lang = self.app.lang
@@ -1154,10 +1163,17 @@ class NetworkPrinterScreen(Gtk.Box):
         add_btn.set_halign(Gtk.Align.END if lang != "ar" else Gtk.Align.START)
         add_btn.set_size_request(120, 36)
 
+        # Build a safe printer name — fall back to model, then IP-based name
+        printer_name = prn.get("name") or model or f"Printer-{ip}"
+        if printer_name == "Unknown":
+            printer_name = f"Printer-{ip}"
+
         printer_data = dict(
-            name=prn.get("name", model),
-            ip=ip,
-            model=model,
+            name=printer_name,
+            ip=ip if ip and ip != "N/A" else "",
+            model=model if model and model != "Unknown" else "",
+            uri=prn.get("uri", ""),
+            full_uri=prn.get("full_uri", ""),
             protocol=proto_raw,
             needs_driver=needs_driver,
         )
@@ -1168,22 +1184,29 @@ class NetworkPrinterScreen(Gtk.Box):
 
             def on_result(res):
                 if res.get("status") == "ok":
-                    btn.set_label(f"✓ {t('success', lang)}")
+                    btn.set_label(f"\u2713 {t('success', lang)}")
                 else:
                     btn.set_label(t("retry", lang))
                     btn.set_sensitive(True)
                     self.app.show_error(res.get("message", t("error", lang)))
 
-            self.app.daemon.send_threaded(
-                {
-                    "action": "add_network_printer",
-                    "name": data["name"],
-                    "ip": data["ip"],
-                    "model": data["model"],
-                    "protocol": data["protocol"],
-                },
-                on_result,
-            )
+            # Build the command with safe values — use uri if ip missing
+            cmd = {
+                "action": "add_network_printer",
+                "name": data["name"],
+                "model": data.get("model", ""),
+            }
+            if data.get("ip"):
+                cmd["ip"] = data["ip"]
+            elif data.get("uri"):
+                cmd["uri"] = data["uri"]
+            else:
+                self.app.show_error(t("error", lang))
+                btn.set_sensitive(True)
+                btn.set_label(t("add", lang))
+                return
+
+            self.app.daemon.send_threaded(cmd, on_result, timeout=60)
 
         add_btn.connect("clicked", _add)
         card.pack_start(add_btn, False, False, 0)
@@ -1542,6 +1565,7 @@ class ThermalPrinterScreen(Gtk.Box):
         self.app.daemon.send_threaded(
             {"action": "detect_usb_printer", "brand": self.brand or "xprinter"},
             self._on_usb,
+            timeout=30,
         )
 
     def _on_usb(self, result):
@@ -1599,11 +1623,11 @@ class ThermalPrinterScreen(Gtk.Box):
         self.driver_spinner.start()
         content.pack_start(self.driver_spinner, False, False, 0)
 
-        pulse_loop(self.driver_progress)
+        GLib.timeout_add(100, pulse_loop, self.driver_progress)
         self.app.daemon.send_threaded(
             {"action": "install_thermal_driver", "brand": self.brand or "xprinter"},
             self._on_driver,
-            timeout=120,
+            timeout=180,
         )
 
     def _on_driver(self, result):
@@ -1899,7 +1923,7 @@ class RepairScreen(Gtk.Box):
             def _fix(btn, pname=name):
                 btn.set_sensitive(False)
                 self.status_lbl.set_text(t("repair_enabling", lang))
-                pulse_loop(self.progress)
+                GLib.timeout_add(100, pulse_loop, self.progress)
 
                 def on_res(res):
                     try:
@@ -1994,7 +2018,7 @@ class SpoolerScreen(Gtk.Box):
         self.fix_btn.set_sensitive(False)
         self.status_lbl.set_text(t("spooler_fixing", lang))
         self.spinner.start()
-        pulse_loop(self.progress)
+        GLib.timeout_add(100, pulse_loop, self.progress)
 
         def on_result(result):
             try:
@@ -2222,7 +2246,7 @@ class UpdateDialog:
         lang = self.app.lang
         btn.set_sensitive(False)
         self.status_lbl.set_text(t("update_downloading", lang))
-        pulse_loop(self.progress)
+        GLib.timeout_add(100, pulse_loop, self.progress)
 
         def on_result(result):
             try:
