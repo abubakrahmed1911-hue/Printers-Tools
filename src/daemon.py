@@ -48,7 +48,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "3.6"
+VERSION = "3.8"
 
 # Paths
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
@@ -99,6 +99,7 @@ AUTO_UPDATE_ENABLED = True      # set to False to disable background auto-update
 
 # Allowed commands whitelist — anything not listed is rejected
 ALLOWED_COMMANDS = {
+    # Core daemon commands
     "fix",
     "scan",
     "remove_printer",
@@ -108,6 +109,7 @@ ALLOWED_COMMANDS = {
     "install_thermal_brand",
     "detect_usb_printers",
     "discover_printers",
+    "list_printers",
     "clear_jobs",
     "test_print",
     "update_all",
@@ -115,16 +117,6 @@ ALLOWED_COMMANDS = {
     "get_version",
     "get_config",
     "set_language",
-    # GUI action aliases (also accepted)
-    "diagnose",
-    "scan_network",
-    "add_network_printer",
-    "install_thermal_driver",
-    "fix_spooler",
-    "detect_usb_printer",
-    "list_printers",
-    "repair_printer",
-    "update",
     "check_update",
     # GUI action aliases (also accepted)
     "diagnose",
@@ -133,7 +125,6 @@ ALLOWED_COMMANDS = {
     "install_thermal_driver",
     "fix_spooler",
     "detect_usb_printer",
-    "list_printers",
     "repair_printer",
     "update",
 }
@@ -257,7 +248,7 @@ def download_file(url: str, dest: str, desc: str = "file") -> bool:
     try:
         os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
         req = urllib.request.Request(url, headers={
-            "User-Agent": "IT-Aman-Daemon/3.4",
+            "User-Agent": "IT-Aman-Daemon/3.8",
         })
         with urllib.request.urlopen(req, timeout=120) as resp:
             with open(dest, "wb") as fh:
@@ -281,7 +272,7 @@ def download_text(url: str, timeout: int = 30) -> str | None:
     """Download a small text file and return its content, or None on error."""
     try:
         req = urllib.request.Request(url, headers={
-            "User-Agent": "IT-Aman-Daemon/3.4",
+            "User-Agent": "IT-Aman-Daemon/3.8",
         })
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read().decode("utf-8", errors="replace").strip()
@@ -373,7 +364,7 @@ def http_probe_model(ip: str) -> str | None:
     for url in urls_to_try:
         try:
             req = urllib.request.Request(url, headers={
-                "User-Agent": "IT-Aman-Daemon/3.4",
+                "User-Agent": "IT-Aman-Daemon/3.8",
             })
             with urllib.request.urlopen(req, timeout=MODEL_PROBE_TIMEOUT) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
@@ -1478,6 +1469,69 @@ def handle_detect_usb_printers(params: dict) -> dict:
     return {"status": "ok", "printers": printers}
 
 
+# ---- handle_list_printers (CUPS installed printers with status) ------------
+
+def handle_list_printers(params: dict) -> dict:
+    """
+    List all CUPS-installed printers with their state, job count, and device URI.
+    This returns the format the GUI expects for Repair, Status, and Remove screens:
+        {name, state, jobs, device}
+    """
+    printers = []
+
+    # Get printer list from lpstat -p
+    rc, out, _ = run_cmd(["lpstat", "-p"])
+    if rc != 0 or not out:
+        return {"status": "ok", "printers": []}
+
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Format: "printer NAME idle/enabled/disabled/stopped since ..."
+        # or: "printer NAME now printing ..."
+        parts = line.split()
+        if len(parts) < 3 or parts[0] != "printer":
+            continue
+
+        name = parts[1]
+        # State is the third word: idle, enabled, disabled, stopped, etc.
+        raw_state = parts[2].lower()
+
+        # Normalize state
+        if raw_state in ("idle", "enabled", "processing", "now"):
+            state = "enabled"
+        elif raw_state in ("disabled", "stopped"):
+            state = "disabled"
+        else:
+            state = raw_state
+
+        # Get device URI
+        device = ""
+        rc2, out2, _ = run_cmd(["lpstat", "-v", name])
+        if rc2 == 0 and out2:
+            # Format: "device for NAME: uri"
+            m = re.search(r'device for \S+:\s+(.*)', out2)
+            if m:
+                device = m.group(1).strip()
+
+        # Get job count
+        jobs = 0
+        rc3, out3, _ = run_cmd(["lpstat", "-o", name])
+        if rc3 == 0 and out3:
+            jobs = len([l for l in out3.splitlines() if l.strip()])
+
+        printers.append({
+            "name": name,
+            "state": state,
+            "jobs": jobs,
+            "device": device,
+        })
+
+    log.info("Listed %d installed printers", len(printers))
+    return {"status": "ok", "printers": printers}
+
+
 # ---- handle_discover_printers (combo of USB + network) --------------------
 
 def handle_discover_printers(params: dict) -> dict:
@@ -1897,6 +1951,7 @@ HANDLERS = {
     "install_thermal_brand": handle_install_thermal_brand,
     "detect_usb_printers": handle_detect_usb_printers,
     "discover_printers": handle_discover_printers,
+    "list_printers": handle_list_printers,
     "clear_jobs": handle_clear_jobs,
     "test_print": handle_test_print,
     "update_all": handle_update_all,
@@ -1912,7 +1967,7 @@ ACTION_ALIASES = {
     "install_thermal_driver": "install_thermal_brand",
     "fix_spooler": "quick_fix_spooler",
     "detect_usb_printer": "detect_usb_printers",
-    "list_printers": "discover_printers",
+    "list_printers": "list_printers",     # Now has its own handler (CUPS installed printers)
     "repair_printer": "fix",
     "update": "update_all",
 }
@@ -1923,6 +1978,10 @@ def process_command(data: dict) -> dict:
     Process a single JSON command from the GUI.
     Accepts both "action" and "command" keys.
     Validates the command against ALLOWED_COMMANDS and dispatches to handler.
+
+    The GUI sends params at the TOP LEVEL of the JSON dict, e.g.:
+        {"action": "add_network_printer", "name": "HP", "ip": "192.168.1.50"}
+    So we extract all keys except "action" and "command" as params.
     """
     # Accept both "action" (from GUI) and "command" (internal)
     command = data.get("action", "") or data.get("command", "")
@@ -1941,9 +2000,16 @@ def process_command(data: dict) -> dict:
     if not handler:
         return {"status": "error", "message": f"No handler for command: {command}"}
 
-    params = data.get("params", {})
-    if not isinstance(params, dict):
-        params = {}
+    # CRITICAL FIX: GUI sends params at top level, not in a "params" key.
+    # Extract everything except "action" and "command" as params.
+    meta_keys = {"action", "command", "params"}
+    params = {k: v for k, v in data.items() if k not in meta_keys}
+    # Also check if there's an explicit "params" dict and merge it
+    explicit_params = data.get("params", {})
+    if isinstance(explicit_params, dict):
+        # Top-level params take priority, then explicit params as fallback
+        merged = {**explicit_params, **params}
+        params = merged
 
     try:
         log.info("Handling command: %s", command)

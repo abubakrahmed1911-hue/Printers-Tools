@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
-# IT Aman Printer Tool v3.6 — Installation Script
+# IT Aman Printer Tool v3.8 — Installation Script
 # ═══════════════════════════════════════════════════════════
 
 set -e
@@ -15,7 +15,7 @@ SERVICE_FILE="/etc/systemd/system/it-aman.service"
 DESKTOP_FILE="/usr/share/applications/it-aman.desktop"
 
 echo "========================================"
-echo " IT Aman Printer Tool v3.6 Installer"
+echo " IT Aman Printer Tool v3.8 Installer"
 echo "========================================"
 echo ""
 
@@ -26,19 +26,23 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # ── 1. Install dependencies ──
-echo "[1/7] Installing dependencies..."
+echo "[1/8] Installing dependencies..."
 apt-get update -qq
 apt-get install -y -qq python3 python3-gi python3-gi-cairo gir1.2-gtk-3.0 \
     cups cups-bsd avahi-daemon avahi-utils \
-    curl wget 2>/dev/null || true
+    curl wget python3-pip 2>/dev/null || true
+
+# Install PyNaCl for Ed25519 update verification
+echo "  Installing PyNaCl for update verification..."
+pip3 install pynacl 2>/dev/null || pip install pynacl 2>/dev/null || echo "  WARNING: PyNaCl install failed — updates will use openssl fallback"
 
 # ── 2. Stop old service if running ──
-echo "[2/7] Stopping old service (if any)..."
+echo "[2/8] Stopping old service (if any)..."
 systemctl stop it-aman.service 2>/dev/null || true
 systemctl disable it-aman.service 2>/dev/null || true
 
 # ── 3. Download files from GitHub ──
-echo "[3/7] Downloading IT Aman files..."
+echo "[3/8] Downloading IT Aman files..."
 mkdir -p "$INSTALL_DIR/src"
 
 BASE_URL="https://raw.githubusercontent.com/$REPO/$BRANCH"
@@ -57,11 +61,11 @@ chmod +x "$INSTALL_DIR/src/gui.py"
 echo "  Downloaded to $INSTALL_DIR"
 
 # ── 4. Create directories ──
-echo "[4/7] Creating directories..."
+echo "[4/8] Creating directories..."
 mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$SOCKET_DIR"
 
 # ── 5. Create systemd service ──
-echo "[5/7] Installing systemd service..."
+echo "[5/8] Installing systemd service..."
 cat > "$SERVICE_FILE" << 'SERVICE_EOF'
 [Unit]
 Description=IT Aman Printer Daemon
@@ -81,7 +85,7 @@ WantedBy=multi-user.target
 SERVICE_EOF
 
 # ── 6. Create desktop shortcut ──
-echo "[6/7] Creating desktop shortcut..."
+echo "[6/8] Creating desktop shortcut..."
 cat > "$DESKTOP_FILE" << 'DESKTOP_EOF'
 [Desktop Entry]
 Name=IT Aman Printer Tool
@@ -96,7 +100,7 @@ Categories=System;Settings;
 DESKTOP_EOF
 
 # ── 7. Enable and start daemon ──
-echo "[7/7] Enabling and starting daemon..."
+echo "[7/8] Enabling and starting daemon..."
 systemctl daemon-reload
 systemctl enable it-aman.service
 systemctl restart it-aman.service
@@ -106,7 +110,7 @@ sleep 2
 
 if systemctl is-active --quiet it-aman.service; then
     echo ""
-    echo "✅ IT Aman Printer Tool v3.6 installed successfully!"
+    echo "✅ IT Aman Printer Tool v3.8 installed successfully!"
     echo ""
     echo "  Daemon: ACTIVE (running in background)"
     echo "  Socket: $SOCKET_DIR/it-aman.sock"

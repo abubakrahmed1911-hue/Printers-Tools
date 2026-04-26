@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IT Aman Printer Support Tool v3.4 — GTK3 Frontend
+IT Aman Printer Support Tool v3.8 — GTK3 Frontend
 
 Communicates with it-aman daemon via Unix socket.
 Language is selected once at startup and locked for the session.
@@ -22,7 +22,7 @@ import subprocess
 
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
 CONFIG_PATH = "/etc/it-aman/config.json"
-APP_VERSION = "3.7"
+APP_VERSION = "3.8"
 APP_NAME = "IT Aman - Printer Support Tool"
 DEVELOPER = "Developed by: IT Helpdesk Operation"
 
@@ -604,15 +604,17 @@ class DaemonClient:
                 return {"status": "error", "message": "Empty response from daemon"}
             return json.loads(text)
         except socket.timeout:
-            return {"status": "error", "message": "Daemon connection timed out"}
+            return {"status": "error", "message": "Daemon connection timed out — the operation may take too long. Try again."}
         except ConnectionRefusedError:
-            return {"status": "error", "message": "Daemon refused connection. Is it running?"}
+            return {"status": "error", "message": "Daemon is not running. Please run: sudo systemctl restart it-aman"}
         except FileNotFoundError:
-            return {"status": "error", "message": "Daemon socket not found. Start the service."}
+            return {"status": "error", "message": "Daemon socket not found. Please run: sudo systemctl restart it-aman"}
         except json.JSONDecodeError as e:
             return {"status": "error", "message": f"Invalid response: {e}"}
+        except ConnectionResetError:
+            return {"status": "error", "message": "Daemon connection lost. Please run: sudo systemctl restart it-aman"}
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            return {"status": "error", "message": f"Connection error: {e}"}
 
     def send_threaded(self, command_dict, callback, timeout=30):
         """Send command in a background thread; invoke callback via GLib.idle_add."""
@@ -955,8 +957,10 @@ class DiagnosticScreen(Gtk.Box):
         status = result.get("status", "error")
 
         if status == "ok":
-            fixes = result.get("fixes", [])
-            if not fixes:
+            # Daemon returns "actions" list, not "fixes"
+            fixes = result.get("actions", result.get("fixes", []))
+            issues_found = result.get("issues_found", 0)
+            if not fixes or (len(fixes) == 1 and "running" in fixes[0].lower() and issues_found == 0):
                 self.status_lbl.set_markup(
                     f"<span size='large' weight='bold' color='#4CAF50'>"
                     f"{t('diag_nothing', lang)}</span>"
@@ -971,6 +975,8 @@ class DiagnosticScreen(Gtk.Box):
                     lbl = Gtk.Label()
                     lbl.set_markup(f"  ✓ {fix}")
                     lbl.set_xalign(xalign)
+                    lbl.set_line_wrap(True)
+                    lbl.set_max_width_chars(60)
                     self.results_box.pack_start(lbl, False, False, 2)
         else:
             msg = result.get("message", t("error", lang))
