@@ -1,1 +1,6 @@
-private.pem 
+private.pem
+*.pyc
+__pycache__/
+*.log
+.DS_Store
+Thumbs.db
