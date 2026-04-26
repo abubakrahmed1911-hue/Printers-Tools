@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
-# IT Aman Printer Tool v3.10 — Installation Script
+# IT Aman Printer Tool v3.11 — Installation Script
 # ═══════════════════════════════════════════════════════════
 
 set -e
@@ -13,9 +13,11 @@ LOG_DIR="/var/log/it-aman"
 SOCKET_DIR="/run/it-aman"
 SERVICE_FILE="/etc/systemd/system/it-aman.service"
 DESKTOP_FILE="/usr/share/applications/it-aman.desktop"
+POLICY_FILE="/usr/share/polkit-1/actions/com.it-aman.gui.policy"
+SUDOERS_FILE="/etc/sudoers.d/it-aman-gui"
 
 echo "========================================"
-echo " IT Aman Printer Tool v3.10 Installer"
+echo " IT Aman Printer Tool v3.11 Installer"
 echo "========================================"
 echo ""
 
@@ -26,19 +28,19 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # ── 1. Install dependencies ──
-echo "[1/7] Installing dependencies..."
+echo "[1/9] Installing dependencies..."
 apt-get update -qq
 apt-get install -y -qq python3 python3-gi python3-gi-cairo gir1.2-gtk-3.0 \
     cups cups-bsd avahi-daemon avahi-utils \
-    curl wget 2>/dev/null || true
+    curl wget policykit-1 2>/dev/null || true
 
 # ── 2. Stop old service if running ──
-echo "[2/7] Stopping old service (if any)..."
+echo "[2/9] Stopping old service (if any)..."
 systemctl stop it-aman.service 2>/dev/null || true
 systemctl disable it-aman.service 2>/dev/null || true
 
 # ── 3. Download files from GitHub ──
-echo "[3/7] Downloading IT Aman files..."
+echo "[3/9] Downloading IT Aman files..."
 mkdir -p "$INSTALL_DIR/src"
 
 BASE_URL="https://raw.githubusercontent.com/$REPO/$BRANCH"
@@ -57,11 +59,11 @@ chmod +x "$INSTALL_DIR/src/gui.py"
 echo "  Downloaded to $INSTALL_DIR"
 
 # ── 4. Create directories ──
-echo "[4/7] Creating directories..."
+echo "[4/9] Creating directories..."
 mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$SOCKET_DIR"
 
 # ── 5. Create systemd service ──
-echo "[5/7] Installing systemd service..."
+echo "[5/9] Installing systemd service..."
 cat > "$SERVICE_FILE" << 'SERVICE_EOF'
 [Unit]
 Description=IT Aman Printer Daemon
@@ -80,23 +82,75 @@ RestartSec=5
 WantedBy=multi-user.target
 SERVICE_EOF
 
-# ── 6. Create desktop shortcut ──
-echo "[6/7] Creating desktop shortcut..."
-cat > "$DESKTOP_FILE" << 'DESKTOP_EOF'
+# ── 6. Install Polkit policy (allows GUI without password) ──
+echo "[6/9] Installing Polkit policy..."
+mkdir -p /usr/share/polkit-1/actions/
+curl -sL "$BASE_URL/com.it-aman.gui.policy" -o "$POLICY_FILE" 2>/dev/null || true
+if [ -f "$POLICY_FILE" ]; then
+    echo "  ✓ Polkit policy installed (no password needed for GUI)"
+else
+    echo "  ⚠ Polkit policy not downloaded — will use sudoers fallback"
+fi
+
+# ── 7. Add sudoers entry (passwordless sudo for GUI) ──
+echo "[7/9] Setting up passwordless sudo for GUI..."
+echo "%users ALL=(root) NOPASSWD: /usr/bin/python3 $INSTALL_DIR/src/gui.py" > "$SUDOERS_FILE"
+chmod 440 "$SUDOERS_FILE"
+echo "  ✓ Sudoers rule installed"
+
+# ── 8. Create desktop shortcut ──
+echo "[8/9] Creating desktop shortcut..."
+
+# Use pkexec if polkit is available, otherwise sudo
+if [ -f "$POLICY_FILE" ]; then
+    EXEC_CMD="pkexec /usr/bin/python3 $INSTALL_DIR/src/gui.py"
+else
+    EXEC_CMD="sudo /usr/bin/python3 $INSTALL_DIR/src/gui.py"
+fi
+
+cat > "$DESKTOP_FILE" << DESKTOP_EOF
 [Desktop Entry]
 Name=IT Aman Printer Tool
 Name[ar]=أداة إدارة الطابعات
-Comment=Printer management tool
-Comment[ar]=أداة إدارة الطابعات
-Exec=sudo python3 /opt/it-aman/src/gui.py
+Comment=Printer management and diagnostic tool
+Comment[ar]=أداة إدارة وتشخيص الطابعات
+Exec=$EXEC_CMD
 Icon=printer
 Terminal=false
 Type=Application
-Categories=System;Settings;
+Categories=System;Settings;HardwareSettings;
+Keywords=printer;CUPS;driver;thermal;network;
+StartupNotify=true
 DESKTOP_EOF
 
-# ── 7. Enable and start daemon ──
-echo "[7/7] Enabling and starting daemon..."
+# Copy shortcut to all user desktops
+for user_home in /home/*; do
+    if [ -d "$user_home/Desktop" ]; then
+        cp "$DESKTOP_FILE" "$user_home/Desktop/it-aman.desktop"
+        USERNAME=$(basename "$user_home")
+        chown "$USERNAME:$USERNAME" "$user_home/Desktop/it-aman.desktop" 2>/dev/null || true
+        chmod +x "$user_home/Desktop/it-aman.desktop" 2>/dev/null || true
+    fi
+    # Arabic desktop folder name
+    if [ -d "$user_home/سطح المكتب" ]; then
+        cp "$DESKTOP_FILE" "$user_home/سطح المكتب/it-aman.desktop"
+        USERNAME=$(basename "$user_home")
+        chown "$USERNAME:$USERNAME" "$user_home/سطح المكتب/it-aman.desktop" 2>/dev/null || true
+        chmod +x "$user_home/سطح المكتب/it-aman.desktop" 2>/dev/null || true
+    fi
+done
+
+# Root desktop too
+if [ -d "/root/Desktop" ]; then
+    cp "$DESKTOP_FILE" "/root/Desktop/it-aman.desktop"
+    chmod +x "/root/Desktop/it-aman.desktop" 2>/dev/null || true
+fi
+
+update-desktop-database /usr/share/applications/ 2>/dev/null || true
+echo "  ✓ Desktop shortcut installed"
+
+# ── 9. Enable and start daemon ──
+echo "[9/9] Enabling and starting daemon..."
 systemctl daemon-reload
 systemctl enable it-aman.service
 systemctl restart it-aman.service
@@ -106,19 +160,23 @@ sleep 2
 
 if systemctl is-active --quiet it-aman.service; then
     echo ""
-    echo "✅ IT Aman Printer Tool v3.10 installed successfully!"
-    echo ""
-    echo "  Daemon: ACTIVE (running in background)"
-    echo "  Socket: $SOCKET_DIR/it-aman.sock"
-    echo "  Config: $CONFIG_DIR/config.json"
-    echo "  Log:    $LOG_DIR/daemon.log"
-    echo ""
-    echo "  Auto-update: ENABLED (checks every 5 minutes)"
-    echo ""
-    echo "To open the GUI:"
-    echo "  sudo python3 $INSTALL_DIR/src/gui.py"
-    echo ""
-    echo "Or find 'IT Aman Printer Tool' in your applications menu."
+    echo "╔══════════════════════════════════════════════════╗"
+    echo "║  ✅ IT Aman Printer Tool v3.11 installed!       ║"
+    echo "╠══════════════════════════════════════════════════╣"
+    echo "║  Daemon: ACTIVE (running in background)         ║"
+    echo "║  Socket: $SOCKET_DIR/it-aman.sock"
+    echo "║  Config: $CONFIG_DIR/config.json"
+    echo "║  Log:    $LOG_DIR/daemon.log"
+    echo "║                                                  ║"
+    echo "║  Auto-update: ENABLED (checks every 5 minutes)  ║"
+    echo "║                                                  ║"
+    echo "║  To open the GUI (pick one):                     ║"
+    echo "║  • Double-click desktop shortcut                 ║"
+    echo "║  • Find it in Applications menu                  ║"
+    echo "║  • Run: pkexec python3 $INSTALL_DIR/src/gui.py"
+    echo "║                                                  ║"
+    echo "║  No need for 'sudo python3 ...' anymore!         ║"
+    echo "╚══════════════════════════════════════════════════╝"
 else
     echo ""
     echo "⚠️  Daemon did not start. Check logs:"
