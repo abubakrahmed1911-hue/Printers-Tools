@@ -1,98 +1,72 @@
 #!/usr/bin/env python3
 """
-IT Aman Printer Daemon v3.0
+IT Aman Printer Daemon v3.4
 ============================
-A systemd-managed Unix socket daemon for managing CUPS printers.
+A Unix socket daemon for managing CUPS printers on Linux.
 Runs as root, listens on /run/it-aman/it-aman.sock, and processes
-JSON commands from the IT Aman GUI.
+JSON commands from the GTK3 GUI client.
 
-Security:
-  - Only whitelisted CUPS commands are executed.
-  - No arbitrary shell commands are permitted.
-  - SHA256 manifest verification for all updates.
-  - chattr +i properly handled during updates.
-  - Config writes done via daemon (root) not GUI (user).
+Key changes from v3.3:
+  - Removed branches system (set_branch, get_branch, data.json handlers)
+  - Updated GITHUB_REPO to "abubakrahmed1911-hue/Printers-Tools"
+  - Update system uses raw.githubusercontent.com (public repo, no token)
+  - Network printer setup: IPP Everywhere first, then LPD+driver fallback
+  - Simplified config (version + language only)
+  - Kept thermal brand install (XP-80, SPRT) and Kyocera auto-install
 
-v3.0 Changes (from v2.5):
-  - FIXED: chattr +i now properly toggled during update with verification
-  - FIXED: Version persistence via daemon (root can write config)
-  - ADDED: save_config handler so GUI can persist version through daemon
-  - ADDED: Branch-aware scan filtering (only printers in current branch)
-  - ADDED: set_branch / get_branch handlers for current branch management
-  - ADDED: SHA256 manifest verification for update downloads
-  - ADDED: Downgrade attack prevention (version must be newer)
-  - FIXED: Thermal printer PPD auto-detection via CUPS lpinfo
-  - FIXED: PPD-based driver method works with CUPS everywhere model
-  - REMOVED: Manual IP add_printer handler (security concern)
-  - IMPROVED: Error logging and immutable flag verification
+Architecture:
+  - Unix socket at /run/it-aman/it-aman.sock
+  - JSON command dispatch via ALLOWED_COMMANDS whitelist
+  - Config at /etc/it-aman/config.json
+  - Logging to /var/log/it-aman/daemon.log
+  - ThreadPoolExecutor for network scan (64 TCP, 20 model probe)
 """
 
-import gzip
-import hashlib
-import json
-import logging
 import os
-import re
-import shutil
-import signal
-import socket
-import subprocess
 import sys
-import tempfile
+import json
+import socket
+import struct
+import signal
+import subprocess
 import threading
+import logging
+import logging.handlers
+import shutil
+import tempfile
+import hashlib
 import time
+import re
+import zipfile
 import urllib.request
-from logging.handlers import RotatingFileHandler
-from typing import Any, Dict, List, Optional, Tuple
+import urllib.error
+import urllib.parse
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-SOCKET_DIR = "/run/it-aman"
-SOCKET_PATH = os.path.join(SOCKET_DIR, "it-aman.sock")
-LOG_DIR = "/var/log/it-aman"
-LOG_FILE = os.path.join(LOG_DIR, "daemon.log")
-TEST_PRINT_FILE = "/usr/share/cups/data/testprint"
-APP_DIR = "/opt/it-aman"
+VERSION = "3.4"
+
+# Paths
+SOCKET_PATH = "/run/it-aman/it-aman.sock"
 CONFIG_DIR = "/etc/it-aman"
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
-DATA_PATH = os.path.join(CONFIG_DIR, "data.json")
-DRIVERS_DIR = os.path.join(CONFIG_DIR, "cache", "drivers")
-MANIFEST_PATH = os.path.join(CONFIG_DIR, "update_manifest.json")
+LOG_DIR = "/var/log/it-aman"
+LOG_PATH = os.path.join(LOG_DIR, "daemon.log")
+PID_PATH = "/run/it-aman/it-aman.pid"
 
-# Thermal driver PPD directory (where install.sh puts them)
-THERMAL_PPD_DIR = "/usr/share/cups/model/printer"
+# GitHub update URLs (public repo — no token required)
+GITHUB_REPO = "abubakrahmed1911-hue/Printers-Tools"
+RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main"
 
-# Thermal PPD files
-THERMAL_PPD_FILES = [
-    "58mmSeries.ppd.gz",
-    "76mmSeries.ppd.gz",
-    "80mmSeries.ppd.gz",
-    "112mmSeries.ppd.gz",
-    "T5.ppd.gz",
-]
-
-# Thermal driver install files from GitHub
-THERMAL_DRIVER_FILES = [
-    "install.sh",
-    "rastertoprinter",
-    "rastertoprintercm",
-    "rastertoprinterlm",
-    "58mmSeries.ppd.gz",
-    "76mmSeries.ppd.gz",
-    "80mmSeries.ppd.gz",
-    "112mmSeries.ppd.gz",
-    "T5.ppd.gz",
-]
-
-# How long to wait for any single subprocess command
-COMMAND_TIMEOUT = 10
-
-# ── External driver URLs (from Printers-Tools merge) ──
+# Driver download URLs
 KYOCERA_DEB_URL = (
     "https://www.dropbox.com/scl/fi/u4ilpehz9aeemnnfeec6z/"
-    "kyodialog_9.3-0_amd64.deb?rlkey=re8satdq4iduzxaqugb7l0oqw&st=4a85xjj9&dl=1"
+    "kyodialog_9.3-0_amd64.deb?rlkey=re8satdq4iduzxaqugb7l0oqw"
+    "&st=4a85xjj9&dl=1"
 )
 XPRINTER_DRIVER_URL = (
     "https://www.dropbox.com/scl/fi/9knkouz84hqeouumyk5bd/"
@@ -100,2565 +74,2097 @@ XPRINTER_DRIVER_URL = (
 )
 SPRT_DRIVER_URL = (
     "https://www.dropbox.com/scl/fo/eoxs40b23h5g8zxk0vhnj/"
-    "AGVfJEgg05my1TcWe1xHCs4?rlkey=pqx2yv4x5blqmz0vks058ef9g&st=hcp53bq0&dl=1"
+    "AGVfJEgg05my1TcWe1xHCs4?rlkey=pqx2yv4x5blqmz0vks058ef9g"
+    "&st=hcp53bq0&dl=1"
 )
+
+# Thermal printer constants
 SPRT_PPD_DEST = "/usr/share/cups/model/SPRIT/80mmSeries.ppd"
 XPRINTER_PRINTER_NAME = "xp80"
 SPRT_PRINTER_NAME = "SPRT"
-KYOCERA_DEB_PATH = "/tmp/it-aman-kyodialog.deb"
 
+# Network scan defaults
+SCAN_TCP_WORKERS = 64
+SCAN_PROBE_WORKERS = 20
+SCAN_PORTS = [631, 9100]          # IPP + raw JetDirect
+SCAN_TIMEOUT_SEC = 1.0            # per TCP connect
+MODEL_PROBE_TIMEOUT = 5           # seconds for HTTP model probe
 
-# GitHub repo for auto-update
-GITHUB_REPO = "abubakrahmed1911-hue/it-aman"
-RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main"
+# Socket buffer
+SOCKET_RECV_BUF = 65536
 
-# Ed25519 public key for manifest signature verification.
-# The private key is NEVER stored in the repository — it is kept offline by the
-# developer and used only by generate_manifest.py when publishing a release.
-# Even if an attacker reads this source code (public repo), they CANNOT forge
-# a valid signature without the private key.
-_MANIFEST_PUBLIC_KEY_B64 = (
-    "Pa/gwSiU/9KZHfv8gTJ2Gy7UHXJXaIY85wqNIbWYMoE="
-)
-
-# Allowed CUPS commands (basenames only) - EXPANDED for thermal driver support
+# Allowed commands whitelist — anything not listed is rejected
 ALLOWED_COMMANDS = {
-    "lpstat",
-    "lpadmin",
-    "lp",
-    "cancel",
-    "cupsenable",
-    "cupsdisable",
-    "cupsaccept",
-    "cupsreject",
+    "fix",
+    "scan",
+    "remove_printer",
+    "quick_fix_spooler",
+    "network_scan",
+    "setup_printer",
+    "install_thermal_brand",
+    "detect_usb_printers",
+    "discover_printers",
+    "clear_jobs",
+    "test_print",
+    "update_all",
     "ping",
-    "ip",
-    "systemctl",
-    "lpinfo",
-    # Added for thermal driver installation:
-    "dpkg",
-    "bash",
-    "apt-get",
-    "lsusb",
-    "wget",
-    "unzip",
-    "chmod",
-    "mkdir",
-    "cp",
-    "sh",
-    "chattr",
+    "get_version",
+    "get_config",
+    "set_language",
 }
 
 # ---------------------------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------------------------
 
-
-def setup_logging() -> logging.Logger:
-    """Configure rotating-aware logging to file and stdout."""
+def setup_logging():
+    """Configure rotating-file logging for the daemon."""
+    os.makedirs(LOG_DIR, exist_ok=True)
     logger = logging.getLogger("it-aman")
     logger.setLevel(logging.DEBUG)
 
-    # Ensure log directory exists
-    os.makedirs(LOG_DIR, exist_ok=True)
-
-    # Rotating file handler -- max 5 MB per file, keep 3 backups
-    file_handler = RotatingFileHandler(
-        LOG_FILE, maxBytes=5*1024*1024, backupCount=3, encoding="utf-8"
+    # Rotating file handler — 2 MB per file, keep 5 backups
+    fh = logging.handlers.RotatingFileHandler(
+        LOG_PATH, maxBytes=2_000_000, backupCount=5
     )
-    file_handler.setLevel(logging.DEBUG)
-    file_fmt = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(threadName)s: %(message)s"
+    fh.setLevel(logging.DEBUG)
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
-    file_handler.setFormatter(file_fmt)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
 
-    # Console handler (goes to journald via systemd)
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_fmt = logging.Formatter("[%(levelname)s] %(message)s")
-    console_handler.setFormatter(console_fmt)
+    # Also log to stderr while in foreground
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
 
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
     return logger
 
 
-logger = setup_logging()
+log = setup_logging()
 
 # ---------------------------------------------------------------------------
-# Global state for graceful shutdown
+# Configuration helpers
 # ---------------------------------------------------------------------------
 
-shutdown_event = threading.Event()
-server_socket: Optional[socket.socket] = None
-active_threads: List[threading.Thread] = []
-active_threads_lock = threading.Lock()
-
-# ---------------------------------------------------------------------------
-# Signal handling
-# ---------------------------------------------------------------------------
+DEFAULT_CONFIG = {
+    "version": VERSION,
+    "language": "en",
+}
 
 
-def handle_signal(signum: int, _frame: Any) -> None:
-    """Handle SIGTERM / SIGINT for graceful shutdown."""
-    sig_name = signal.Signals(signum).name
-    logger.info("Received %s -- initiating graceful shutdown...", sig_name)
-    shutdown_event.set()
-
-    if server_socket:
-        try:
-            server_socket.close()
-        except OSError:
-            pass
-
-
-# ---------------------------------------------------------------------------
-# Config handling (root-owned, daemon writes)
-# ---------------------------------------------------------------------------
-
-
-def _load_config() -> Dict[str, Any]:
-    """Load config.json. Creates default if missing."""
+def load_config() -> dict:
+    """Load config from disk, returning defaults if missing."""
     try:
         if os.path.isfile(CONFIG_PATH):
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Could not load config.json: %s -- creating default", exc)
-    return {
-        "github_repo": GITHUB_REPO,
-        "version": "3.0",
-        "last_update_check": 0,
-        "current_branch_id": "",
-    }
+            with open(CONFIG_PATH, "r") as fh:
+                cfg = json.load(fh)
+            # Merge with defaults so new keys appear
+            merged = {**DEFAULT_CONFIG, **cfg}
+            return merged
+    except Exception as exc:
+        log.warning("Failed to load config: %s — using defaults", exc)
+    return dict(DEFAULT_CONFIG)
 
 
-def _save_config(config: Dict[str, Any]) -> bool:
-    """Save config.json (runs as root, so it can write to /etc/it-aman/)."""
+def save_config(cfg: dict):
+    """Persist config to disk (atomic write)."""
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
-        return True
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(cfg, fh, indent=2)
+        os.replace(tmp, CONFIG_PATH)
+        log.info("Config saved to %s", CONFIG_PATH)
     except Exception as exc:
-        logger.error("Failed to save config.json: %s", exc)
-        return False
+        log.error("Failed to save config: %s", exc)
 
-
-# Global config
-_config: Dict[str, Any] = _load_config()
 
 # ---------------------------------------------------------------------------
-# Utility: safe command execution
+# Shell helpers
 # ---------------------------------------------------------------------------
 
-
-def validate_command_args(cmd: List[str]) -> bool:
+def run_cmd(cmd: list, timeout: int = 30, check: bool = False) -> tuple:
     """
-    Ensure every token in the command list is either:
-      - an absolute path to an allowed binary, or
-      - a flag/argument (starts with '-', contains no shell metacharacters)
-      - a simple alphanumeric name / IP address (no shell injection)
-
-    Returns True if the command is considered safe.
+    Run a subprocess command and return (returncode, stdout, stderr).
+    Decodes output as UTF-8 with replacement for safety.
     """
-    for token in cmd:
-        # First token must be the command itself
-        base = os.path.basename(token.split()[0]) if token else ""
-        if not base:
-            return False
-
-        # Flags are fine
-        if token.startswith("-"):
-            # Reject anything with shell metacharacters
-            if re.search(r'[;&|`$><!()]', token):
-                return False
-            continue
-
-        # Check if this is the command binary itself
-        if base in ALLOWED_COMMANDS:
-            # Verify it's an absolute path or bare name
-            if "/" in token and not token.startswith("/"):
-                return False
-            continue
-
-        # Non-command tokens: only allow safe characters
-        if not re.match(r'^[a-zA-Z0-9_\-.\/:+%?=]+$', token):
-            return False
-
-    return True
-
-
-def run_command(
-    cmd: List[str],
-    timeout: int = COMMAND_TIMEOUT,
-    check: bool = False,
-) -> Tuple[int, str, str]:
-    """
-    Safely execute a subprocess command.
-    Returns (returncode, stdout, stderr)
-    """
-    # Security gate
-    if not validate_command_args(cmd):
-        logger.error("Blocked unsafe command: %s", cmd)
-        return (1, "", "Error: command failed security validation")
-
-    logger.debug("Running command: %s", " ".join(cmd))
+    log.debug("run_cmd: %s", cmd)
     try:
-        result = subprocess.run(
+        proc = subprocess.run(
             cmd,
-            capture_output=True,
-            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             timeout=timeout,
-            check=check,
+            check=False,
         )
-        return (result.returncode, result.stdout.strip(), result.stderr.strip())
+        out = proc.stdout.decode("utf-8", errors="replace").strip()
+        err = proc.stderr.decode("utf-8", errors="replace").strip()
+        if check and proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, cmd, out, err)
+        return proc.returncode, out, err
     except subprocess.TimeoutExpired:
-        logger.warning("Command timed out after %ds: %s", timeout, cmd)
-        return (1, "", f"Command timed out after {timeout}s")
+        log.warning("Command timed out: %s", cmd)
+        return -1, "", "timeout"
     except FileNotFoundError:
-        logger.error("Command not found: %s", cmd[0])
-        return (1, "", f"Command not found: {cmd[0]}")
-    except subprocess.SubprocessError as exc:
-        logger.error("Subprocess error: %s", exc)
-        return (1, "", str(exc))
+        log.warning("Command not found: %s", cmd[0])
+        return -2, "", f"command not found: {cmd[0]}"
+    except Exception as exc:
+        log.error("run_cmd exception: %s", exc)
+        return -3, "", str(exc)
+
+
+def run_shell(script: str, timeout: int = 60) -> tuple:
+    """Run a shell command string and return (returncode, stdout, stderr)."""
+    return run_cmd(["bash", "-c", script], timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
-# Printer name sanitiser
+# Network helpers
 # ---------------------------------------------------------------------------
 
-_SAFE_PRINTER_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_\-.]*$')
-
-
-def sanitize_printer_name(name: str) -> Optional[str]:
-    """Return a sanitized printer name or None if invalid."""
-    if not name or len(name) > 127:
-        return None
-    name = name.replace(" ", "_")
-    if not _SAFE_PRINTER_RE.match(name):
-        return None
-    return name
-
-
-# Strict IPv4 regex
-_IPV4_RE = re.compile(
-    r'^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)$'
-)
-
-
-def sanitize_ip(ip: str) -> Optional[str]:
-    """Validate IPv4 address format. Returns the IP or None."""
-    if not ip:
-        return None
-    ip = ip.strip()
-    if not _IPV4_RE.match(ip):
-        return None
-    parts = ip.split(".")
-    for part in parts:
-        try:
-            num = int(part)
-            if num < 0 or num > 255:
-                return None
-        except ValueError:
-            return None
-    return ip
-
-
-# ---------------------------------------------------------------------------
-# PPD validation helper
-# ---------------------------------------------------------------------------
-
-
-def validate_ppd_file(ppd_path: str) -> Tuple[bool, str]:
-    """Validate a PPD file before passing it to lpadmin."""
-    if not os.path.isfile(ppd_path):
-        return False, f"PPD file not found: {ppd_path}"
-    if not os.access(ppd_path, os.R_OK):
-        return False, f"PPD file not readable: {ppd_path}"
-
-    file_size = os.path.getsize(ppd_path)
-    if file_size == 0:
-        return False, f"PPD file is empty: {ppd_path}"
-
-    # For gzipped PPD files, decompress and check content
-    if ppd_path.endswith(".gz"):
-        try:
-            with gzip.open(ppd_path, "rb") as f:
-                head = f.read(4096)
-        except (gzip.BadGzipFile, OSError) as exc:
-            return False, f"Corrupt gzipped PPD file: {exc}"
-        try:
-            content = head.decode("utf-8", errors="replace")
-        except Exception:
-            return False, "Cannot decode gzipped PPD file"
-    else:
-        try:
-            with open(ppd_path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read(4096)
-        except OSError as exc:
-            return False, f"Cannot read PPD file: {exc}"
-
-    has_ppd_adobe = "*PPD-Adobe" in content
-    has_format_version = "*FormatVersion" in content
-
-    if not has_ppd_adobe and not has_format_version:
-        return False, f"File does not appear to be a valid PPD: {ppd_path}"
-
-    return True, "Valid PPD file"
-
-
-# ---------------------------------------------------------------------------
-# data.json handling
-# ---------------------------------------------------------------------------
-
-def _load_data_json() -> Dict[str, Any]:
-    """Load data.json with proper fallback."""
+def download_file(url: str, dest: str, desc: str = "file") -> bool:
+    """Download a file from *url* to *dest*. Returns True on success."""
+    log.info("Downloading %s from %s", desc, url)
     try:
-        if os.path.isfile(DATA_PATH):
-            with open(DATA_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if "branches" not in data or not isinstance(data["branches"], list):
-                logger.warning("data.json has invalid structure, resetting to default")
-                return {"branches": []}
-            return data
-        else:
-            logger.info("data.json not found at %s", DATA_PATH)
-            return {"branches": []}
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Could not load data.json: %s", exc)
-        return {"branches": []}
-
-
-def _save_data_json(data: Dict[str, Any]) -> bool:
-    """Save data to data.json. Returns True on success."""
-    try:
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(DATA_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "IT-Aman-Daemon/3.4",
+        })
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            with open(dest, "wb") as fh:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+        size = os.path.getsize(dest)
+        log.info("Downloaded %s (%d bytes) to %s", desc, size, dest)
         return True
     except Exception as exc:
-        logger.error("Failed to save data.json: %s", exc)
+        log.error("Download failed for %s: %s", desc, exc)
+        # Clean up partial file
+        if os.path.isfile(dest):
+            os.remove(dest)
         return False
 
 
-def _get_branch_printer_names(branch_id: str) -> set:
-    """Get set of printer names for a specific branch from data.json."""
-    data = _load_data_json()
-    names = set()
-    for branch in data.get("branches", []):
-        if branch.get("branch_id", "") == branch_id:
-            for p in branch.get("printers", []):
-                pname = p.get("name", "")
-                if pname:
-                    names.add(pname)
-    return names
+def download_text(url: str, timeout: int = 30) -> str | None:
+    """Download a small text file and return its content, or None on error."""
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "IT-Aman-Daemon/3.4",
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="replace").strip()
+    except Exception as exc:
+        log.error("download_text failed for %s: %s", url, exc)
+        return None
 
 
-def _get_all_data_printer_names() -> Dict[str, str]:
-    """Get mapping of printer_name -> branch_id for ALL printers in data.json."""
-    data = _load_data_json()
-    mapping = {}
-    for branch in data.get("branches", []):
-        bid = branch.get("branch_id", "")
-        for p in branch.get("printers", []):
-            pname = p.get("name", "")
-            if pname:
-                mapping[pname] = bid
-    return mapping
+def get_local_subnet() -> str | None:
+    """
+    Determine the local /24 subnet for scanning.
+    Returns something like '192.168.1' or None.
+    """
+    try:
+        # Create a UDP socket to an external address (doesn't actually send)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(2)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        # Return first three octets
+        parts = local_ip.split(".")
+        if len(parts) == 4:
+            subnet = ".".join(parts[:3])
+            log.info("Detected local subnet: %s.0/24", subnet)
+            return subnet
+    except Exception as exc:
+        log.warning("Could not determine local subnet: %s", exc)
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Config handlers (daemon writes config as root)
+# TCP port scanner (used by network_scan)
 # ---------------------------------------------------------------------------
 
+def tcp_check(ip: str, port: int, timeout: float = SCAN_TIMEOUT_SEC) -> bool:
+    """Return True if *ip:port* accepts a TCP connection."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            result = s.connect_ex((ip, port))
+            return result == 0
+    except Exception:
+        return False
 
-def handle_save_config(data: Dict[str, Any]) -> Dict[str, Any]:
+
+def scan_subnet_tcp(subnet: str) -> list[dict]:
     """
-    Save configuration values via the daemon (runs as root).
-    This allows the GUI (non-root) to persist config changes.
+    Scan an entire /24 subnet for SCAN_PORTS using a thread pool.
+    Returns list of dicts: {ip, port, open}.
     """
-    global _config
-    logger.info("Action: save_config")
+    results = []
+    base = subnet
 
-    # Only allow specific safe keys
-    allowed_keys = {"version", "last_update_check", "current_branch_id", "language"}
-    updated = []
-    for key in allowed_keys:
-        if key in data:
-            _config[key] = data[key]
-            updated.append(key)
+    def _check(host_byte: int):
+        ip = f"{base}.{host_byte}"
+        for port in SCAN_PORTS:
+            if tcp_check(ip, port):
+                return {"ip": ip, "port": port, "open": True}
+        return None
 
-    if _save_config(_config):
-        return {"status": "ok", "message": f"Saved config keys: {', '.join(updated)}"}
+    with ThreadPoolExecutor(max_workers=SCAN_TCP_WORKERS) as pool:
+        futures = {pool.submit(_check, h): h for h in range(1, 255)}
+        for fut in as_completed(futures):
+            res = fut.result()
+            if res is not None:
+                results.append(res)
+
+    log.info("TCP scan found %d hosts on %s.0/24", len(results), base)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# HTTP model probe (used by network_scan)
+# ---------------------------------------------------------------------------
+
+def http_probe_model(ip: str) -> str | None:
+    """
+    Try to determine the printer model via HTTP/IPP queries.
+    Queries:
+      1. http://IP:631/ipp/print (CUPS IPP Everywhere resource)
+      2. http://IP/index.html    (common printer web UI)
+    Returns model string or None.
+    """
+    urls_to_try = [
+        f"http://{ip}:631/ipp/print",
+        f"http://{ip}/index.html",
+    ]
+    for url in urls_to_try:
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "IT-Aman-Daemon/3.4",
+            })
+            with urllib.request.urlopen(req, timeout=MODEL_PROBE_TIMEOUT) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+                # Look for common model patterns
+                for pattern in [
+                    r'<title>(.*?)</title>',
+                    r'printer-model["\s:]+(["\']?)([^"\']+)\1',
+                    r'product\s*=\s*"([^"]+)"',
+                    r'Model[^:]*:\s*([^\n<]+)',
+                ]:
+                    m = re.search(pattern, body, re.IGNORECASE)
+                    if m:
+                        model = m.group(1 if pattern != r'product\s*=\s*"([^"]+)"' else 1).strip()
+                        if model and len(model) < 200:
+                            log.info("HTTP probe for %s found model: %s", ip, model)
+                            return model
+        except Exception:
+            continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# CUPS helpers
+# ---------------------------------------------------------------------------
+
+def cups_is_running() -> bool:
+    """Check if the CUPS service is active."""
+    rc, _, _ = run_cmd(["systemctl", "is-active", "--quiet", "cups"])
+    return rc == 0
+
+
+def cups_restart() -> bool:
+    """Restart the CUPS service. Returns True on success."""
+    rc, _, err = run_cmd(["systemctl", "restart", "cups"])
+    if rc == 0:
+        log.info("CUPS restarted successfully")
+        return True
+    log.error("CUPS restart failed: %s", err)
+    return False
+
+
+def cups_start() -> bool:
+    """Start the CUPS service. Returns True on success."""
+    rc, _, err = run_cmd(["systemctl", "start", "cups"])
+    if rc == 0:
+        log.info("CUPS started successfully")
+        return True
+    log.error("CUPS start failed: %s", err)
+    return False
+
+
+def cups_stop() -> bool:
+    """Stop the CUPS service. Returns True on success."""
+    rc, _, err = run_cmd(["systemctl", "stop", "cups"])
+    if rc == 0:
+        log.info("CUPS stopped successfully")
+        return True
+    log.error("CUPS stop failed: %s", err)
+    return False
+
+
+def get_cups_backends() -> list[str]:
+    """Return list of URIs from lpinfo -v (existing CUPS backends)."""
+    rc, out, _ = run_cmd(["lpinfo", "-v"])
+    if rc != 0 or not out:
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def get_cups_ppd_drivers() -> list[dict]:
+    """Return list of available PPD drivers from lpinfo -m."""
+    rc, out, _ = run_cmd(["lpinfo", "-m"], timeout=15)
+    if rc != 0 or not out:
+        return []
+    drivers = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Format: "make-and-model  ppd-name"
+        parts = line.split(maxsplit=1)
+        if len(parts) == 2:
+            drivers.append({"ppd": parts[0], "description": parts[1]})
+        elif len(parts) == 1:
+            drivers.append({"ppd": parts[0], "description": parts[0]})
+    return drivers
+
+
+def find_ppd_for_model(model: str) -> str | None:
+    """
+    Search lpinfo -m output for a PPD matching the given model name.
+    Returns the PPD name (e.g. 'manufacturer-PPDs/Kyocera/...') or None.
+    """
+    drivers = get_cups_ppd_drivers()
+    model_lower = model.lower()
+    # Score-based matching
+    best_match = None
+    best_score = 0
+    for drv in drivers:
+        desc_lower = drv["description"].lower()
+        ppd_lower = drv["ppd"].lower()
+        # Count how many model keywords appear
+        keywords = [w for w in model_lower.split() if len(w) > 2]
+        score = sum(1 for kw in keywords if kw in desc_lower or kw in ppd_lower)
+        if score > best_score:
+            best_score = score
+            best_match = drv["ppd"]
+    if best_match and best_score >= 2:
+        log.info("Found PPD for '%s': %s (score=%d)", model, best_match, best_score)
+        return best_match
+    return None
+
+
+def is_printer_exists(name: str) -> bool:
+    """Check if a printer with the given name already exists in CUPS."""
+    rc, out, _ = run_cmd(["lpstat", "-p", name])
+    return rc == 0
+
+
+def get_usb_uris() -> list[str]:
+    """Return list of USB printer URIs from lpinfo -v."""
+    backends = get_cups_backends()
+    return [b.split(":", 1)[1].strip() for b in backends if b.startswith("usb://")]
+
+
+# ---------------------------------------------------------------------------
+# Kyocera driver auto-install
+# ---------------------------------------------------------------------------
+
+def install_kyocera_driver() -> bool:
+    """
+    Download and install the Kyocera deb package from Dropbox.
+    Returns True on success.
+    """
+    log.info("Installing Kyocera driver from Dropbox")
+    tmp_dir = tempfile.mkdtemp(prefix="kyocera_")
+    deb_path = os.path.join(tmp_dir, "kyodialog_9.3-0_amd64.deb")
+
+    try:
+        if not download_file(KYOCERA_DEB_URL, deb_path, "Kyocera driver deb"):
+            return False
+
+        # Install with dpkg
+        rc, out, err = run_cmd(["dpkg", "-i", deb_path], timeout=60)
+        if rc != 0:
+            log.warning("dpkg -i returned %d: %s", rc, err)
+            # Try to fix dependencies
+            run_cmd(["apt-get", "install", "-f", "-y"], timeout=120)
+        else:
+            log.info("Kyocera driver installed successfully")
+
+        # Restart CUPS to pick up new PPDs
+        cups_restart()
+        return True
+    except Exception as exc:
+        log.error("Kyocera driver install failed: %s", exc)
+        return False
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Thermal printer cut-defaults helper
+# ---------------------------------------------------------------------------
+
+def _set_thermal_cut_defaults(printer_name: str):
+    """
+    Set thermal-printer-specific defaults after installation.
+    Ensures the printer uses partial cut and sensible paper sizes.
+    """
+    # Common thermal defaults: 80mm paper, no margins, raw mode
+    lpoptions = [
+        "media=80mm",
+        "orientation-requested=3",   # portrait
+    ]
+    # Build lpadmin -p NAME -o key=value for each option
+    cmd = ["lpadmin", "-p", printer_name]
+    for opt in lpoptions:
+        cmd.extend(["-o", opt])
+    rc, _, err = run_cmd(cmd)
+    if rc != 0:
+        log.warning("Failed to set thermal defaults for %s: %s", printer_name, err)
     else:
-        return {"status": "error", "message": "Failed to save config"}
+        log.info("Set thermal cut defaults for %s", printer_name)
 
+    # Also try to set DocumentCut and FullCut via lpoptions
+    cut_opts = [
+        f"-o", "DocumentCut=PartialCut",
+        f"-o", "FullCut=PartialCut",
+    ]
+    rc2, _, err2 = run_cmd(["lpadmin", "-p", printer_name] + cut_opts)
+    if rc2 != 0:
+        log.debug("Cut options not supported for %s (non-fatal): %s", printer_name, err2)
 
-def handle_get_config(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Return current config (safe keys only)."""
-    return {
-        "status": "ok",
-        "config": {
-            "version": _config.get("version", "0.0"),
-            "last_update_check": _config.get("last_update_check", 0),
-            "current_branch_id": _config.get("current_branch_id", ""),
-            "github_repo": _config.get("github_repo", GITHUB_REPO),
-            "language": _config.get("language", "en"),
-        },
-    }
-
-
-def handle_set_branch(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Set the current branch for this machine."""
-    global _config
-    branch_id = data.get("branch_id", "").strip()
-    if not branch_id:
-        return {"status": "error", "message": "branch_id is required"}
-
-    # Verify branch exists in data.json
-    data_json = _load_data_json()
-    found = False
-    branch_name = ""
-    for branch in data_json.get("branches", []):
-        if branch.get("branch_id", "") == branch_id:
-            found = True
-            branch_name = branch.get("branch_name", "")
-            break
-
-    if not found:
-        return {"status": "error", "message": f"Branch '{branch_id}' not found in data.json"}
-
-    _config["current_branch_id"] = branch_id
-    _save_config(_config)
-
-    logger.info("Current branch set to: %s (%s)", branch_id, branch_name)
-    return {"status": "ok", "branch_id": branch_id, "branch_name": branch_name}
-
-
-def handle_get_branch(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Get the current branch setting."""
-    branch_id = _config.get("current_branch_id", "")
-    branch_name = ""
-    if branch_id:
-        data_json = _load_data_json()
-        for branch in data_json.get("branches", []):
-            if branch.get("branch_id", "") == branch_id:
-                branch_name = branch.get("branch_name", "")
-                break
-    return {
-        "status": "ok",
-        "branch_id": branch_id,
-        "branch_name": branch_name,
-    }
+    # Enable and accept
+    run_cmd(["cupsenable", printer_name])
+    run_cmd(["cupsaccept", printer_name])
 
 
 # ---------------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------------
 
+def handle_ping(params: dict) -> dict:
+    """Simple connectivity check."""
+    return {"status": "ok", "message": "pong", "version": VERSION}
 
-def handle_scan(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Scan printers and return their status.
-    FILTERS by current branch if current_branch_id is set in config.
-    Only shows printers that exist in data.json for the current branch.
-    If no branch is set, shows all printers but warns.
-    """
-    logger.info("Action: scan")
 
-    # Determine filtering
-    current_branch_id = _config.get("current_branch_id", "")
-    if current_branch_id:
-        allowed_names = _get_branch_printer_names(current_branch_id)
-        logger.info("Filtering scan by branch '%s': %d printers allowed",
-                     current_branch_id, len(allowed_names))
+def handle_get_version(params: dict) -> dict:
+    """Return the daemon version."""
+    return {"status": "ok", "version": VERSION}
+
+
+def handle_get_config(params: dict) -> dict:
+    """Return the current configuration."""
+    cfg = load_config()
+    return {"status": "ok", "config": cfg}
+
+
+def handle_set_language(params: dict) -> dict:
+    """Set the GUI language in config."""
+    lang = params.get("language", "en")
+    if not isinstance(lang, str) or len(lang) != 2:
+        return {"status": "error", "message": "Invalid language code (expected 2-letter ISO)"}
+    cfg = load_config()
+    cfg["language"] = lang
+    save_config(cfg)
+    return {"status": "ok", "language": lang}
+
+
+# ---- handle_fix (Smart Diagnostic) ----------------------------------------
+
+def handle_fix(params: dict) -> dict:
+    """
+    Smart diagnostic: check CUPS status, stuck jobs, disabled printers,
+    and attempt automatic fixes. Returns a detailed report.
+    """
+    report = {"status": "ok", "actions": [], "issues_found": 0}
+
+    # 1. Check if CUPS is running
+    if not cups_is_running():
+        report["issues_found"] += 1
+        log.info("CUPS not running — attempting restart")
+        if cups_restart():
+            report["actions"].append("CUPS was not running; restarted successfully")
+        else:
+            report["actions"].append("CUPS was not running; restart FAILED")
+            report["status"] = "error"
+            return report
     else:
-        allowed_names = None  # No filtering
+        report["actions"].append("CUPS service is running")
 
-    # Get printer list via lpstat -p
-    rc, stdout, stderr = run_command(["lpstat", "-p"])
-    if rc != 0:
-        logger.error("lpstat -p failed: %s", stderr)
-        return {"status": "error", "message": f"Failed to query printers: {stderr}"}
-
-    # Parse lpstat -p output
-    printers: List[Dict[str, Any]] = []
-    printer_states: Dict[str, str] = {}
-
-    for line in stdout.splitlines():
-        m = re.match(r'^printer\s+(\S+)\s+(?:is\s+)?(\S+)', line)
-        if m:
-            pname = m.group(1)
-            pstate_raw = m.group(2)
-            if pstate_raw in ("idle", "processing"):
-                printer_states[pname] = "idle"
-            else:
-                printer_states[pname] = "disabled"
-
-    # Apply branch filter FIRST - only keep printers in data.json
-    if allowed_names is not None:
-        filtered_states = {k: v for k, v in printer_states.items() if k in allowed_names}
-        # Also add printers from data.json that aren't in CUPS (not installed yet)
-        for pname in allowed_names:
-            if pname not in filtered_states:
-                filtered_states[pname] = "not_installed"
-        printer_states = filtered_states
-
-    # Get device URIs via lpstat -v
-    rc_v, stdout_v, _ = run_command(["lpstat", "-v"])
-    printer_ips: Dict[str, str] = {}
-    printer_uris: Dict[str, str] = {}
-    if rc_v == 0:
-        for line in stdout_v.splitlines():
-            m = re.match(r'^device for\s+(\S+):\s+(.+)$', line.strip())
-            if m:
-                pname = m.group(1)
-                uri = m.group(2).strip()
-                printer_uris[pname] = uri
-                ip_m = re.search(r'://([^:/]+)', uri)
-                if ip_m:
-                    host = ip_m.group(1)
-                    if sanitize_ip(host):
-                        printer_ips[pname] = host
-
-    # Ping network printers concurrently
-    printer_reachable: Dict[str, bool] = {}
-    if printer_ips:
-        def _ping_one(pname: str, ip: str) -> Tuple[str, bool]:
-            rc, _, _ = run_command(["ping", "-c", "1", "-W", "2", ip])
-            return pname, (rc == 0)
-
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor(max_workers=min(len(printer_ips), 20)) as executor:
-            futures = {executor.submit(_ping_one, pn, ip): pn for pn, ip in printer_ips.items()}
-            for future in as_completed(futures):
-                try:
-                    pname, reachable = future.result()
-                    printer_reachable[pname] = reachable
-                except Exception as exc:
-                    logger.warning("Ping thread error for %s: %s", futures[future], exc)
-
-    # Get job count per printer
-    rc_jobs, stdout_jobs, _ = run_command(["lpstat", "-o"])
-    job_counts: Dict[str, int] = {}
-    if rc_jobs == 0:
-        for line in stdout_jobs.splitlines():
-            parts = line.split()
+    # 2. Check for stuck jobs
+    rc, out, _ = run_cmd(["lpstat", "-o"])
+    if rc == 0 and out:
+        stuck_printers = set()
+        for line in out.splitlines():
+            parts = line.strip().split()
             if parts:
-                full_id = parts[0]
-                jm = re.match(r'^(.+?)-\d+$', full_id)
-                pname = jm.group(1) if jm else full_id
-                job_counts[pname] = job_counts.get(pname, 0) + 1
-
-    # Check accepting status
-    rc_accept, stdout_accept, _ = run_command(["lpstat", "-a"])
-    accepting_map: Dict[str, bool] = {}
-    if rc_accept == 0:
-        for line in stdout_accept.splitlines():
-            m = re.match(r'^(\S+)\s+(accepting|rejecting)', line)
-            if m:
-                accepting_map[m.group(1)] = m.group(2) == "accepting"
-
-    # Build printer list with rule engine
-    online_count = 0
-    offline_count = 0
-    error_count = 0
-    not_installed_count = 0
-
-    # Load data.json for additional printer info (IP, model, driver)
-    data_json = _load_data_json()
-    data_printers = {}
-    for branch in data_json.get("branches", []):
-        for p in branch.get("printers", []):
-            data_printers[p.get("name", "")] = p
-
-    for pname, state in printer_states.items():
-        jobs = job_counts.get(pname, 0)
-        accepting = accepting_map.get(pname, False)
-        ip = printer_ips.get(pname, data_printers.get(pname, {}).get("ip", ""))
-        reachable = printer_reachable.get(pname, None)
-        uri = printer_uris.get(pname, "")
-
-        # Not installed in CUPS
-        if state == "not_installed":
-            status = "Not Installed"
-            not_installed_count += 1
-        elif ip and reachable is False:
-            status = "Network Issue"
-            error_count += 1
-        elif state == "disabled":
-            status = "CUPS Issue"
-            offline_count += 1
-        elif not accepting and state != "not_installed":
-            status = "Error"
-            error_count += 1
-        elif state == "processing":
-            status = "Online"
-            online_count += 1
-        elif jobs > 0 and state == "idle":
-            status = "Stuck Jobs"
-            error_count += 1
-        elif (ip and reachable is True and state == "idle") or (not ip and state == "idle"):
-            status = "Online"
-            online_count += 1
-        else:
-            status = "Unknown"
-            offline_count += 1
-
-        printer_info = {
-            "name": pname,
-            "state": state,
-            "status": status,
-            "jobs": jobs,
-            "accepting": accepting,
-            "ip": ip,
-            "reachable": reachable,
-            "uri": uri,
-        }
-
-        # Add data.json info
-        if pname in data_printers:
-            printer_info["model"] = data_printers[pname].get("model", "")
-            printer_info["driver"] = data_printers[pname].get("driver", "")
-
-        printers.append(printer_info)
-
-    summary = {
-        "total_printers": len(printers),
-        "online_printers": online_count,
-        "offline_printers": offline_count,
-        "error_printers": error_count,
-        "not_installed_printers": not_installed_count,
-        "branch_filter": current_branch_id or "ALL",
-    }
-
-    return {
-        "status": "ok",
-        "printers": printers,
-        "summary": summary,
-    }
-
-
-def handle_ping_printer(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Ping a printer IP to check network reachability."""
-    ip = data.get("ip", "")
-    ip = sanitize_ip(ip) or ""
-    if not ip:
-        return {"status": "error", "message": "Invalid or missing IP address"}
-
-    logger.info("Action: ping_printer -- ip=%s", ip)
-
-    rc, stdout, stderr = run_command(["ping", "-c", "2", "-W", "2", ip])
-    if rc != 0:
-        return {"status": "ok", "reachable": False, "latency_ms": None}
-
-    latency_ms: Optional[float] = None
-    latency_match = re.search(
-        r'rtt\s+min/avg/max/mdev\s+=\s+[\d.]+/([\d.]+)/', stdout
-    )
-    if latency_match:
-        try:
-            latency_ms = round(float(latency_match.group(1)), 2)
-        except ValueError:
-            pass
-
-    return {"status": "ok", "reachable": True, "latency_ms": latency_ms}
-
-
-def handle_fix(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Attempt to fix a printer: ping -> enable -> accept -> clear stuck jobs."""
-    printer_name = sanitize_printer_name(data.get("printer_name", "") or "")
-    printer_ip = sanitize_ip(data.get("printer_ip", "") or "")
-
-    if not printer_name:
-        return {"status": "error", "message": "Invalid or missing printer name"}
-
-    logger.info("Action: fix -- printer=%s ip=%s", printer_name, printer_ip)
-    steps: List[Dict[str, str]] = []
-
-    # Step 1: Network check — WARNING only, not fatal.
-    # Some printers block ICMP ping. We still attempt CUPS repair steps.
-    if printer_ip:
-        rc, stdout, stderr = run_command(["ping", "-c", "2", "-W", "2", printer_ip])
-        if rc == 0:
-            latency_match = re.search(
-                r'rtt\s+min/avg/max/mdev\s+=\s+[\d.]+/([\d.]+)/', stdout
+                # Format: "printer-name-123  user  size  date"
+                printer = "-".join(parts[0].split("-")[:-1]) if "-" in parts[0] else parts[0]
+                stuck_printers.add(printer)
+        if stuck_printers:
+            report["issues_found"] += 1
+            for p in stuck_printers:
+                log.info("Cancelling stuck jobs on %s", p)
+                run_cmd(["cancel", "-a", p])
+            report["actions"].append(
+                f"Found stuck jobs on: {', '.join(stuck_printers)}; cancelled all"
             )
-            latency = latency_match.group(1) if latency_match else "N/A"
-            steps.append({
-                "step": "Network Check",
-                "status": "success",
-                "message": f"Printer connected -- latency {latency} ms",
+        else:
+            report["actions"].append("No stuck print jobs found")
+    else:
+        report["actions"].append("No stuck print jobs found")
+
+    # 3. Check for disabled printers
+    rc, out, _ = run_cmd(["lpstat", "-p"])
+    disabled = []
+    if rc == 0 and out:
+        for line in out.splitlines():
+            if "disabled" in line.lower():
+                # Format: "printer NAME disabled since ..."
+                parts = line.split()
+                if len(parts) >= 2:
+                    name = parts[1]
+                    disabled.append(name)
+
+    if disabled:
+        report["issues_found"] += 1
+        for name in disabled:
+            log.info("Enabling disabled printer: %s", name)
+            run_cmd(["cupsenable", name])
+            run_cmd(["cupsaccept", name])
+        report["actions"].append(
+            f"Re-enabled disabled printers: {', '.join(disabled)}"
+        )
+    else:
+        report["actions"].append("All printers are enabled")
+
+    # 4. Check CUPS error log for recent errors
+    rc, out, _ = run_cmd(
+        ["bash", "-c", "tail -50 /var/log/cups/error_log 2>/dev/null | grep -i error | tail -5"]
+    )
+    if out:
+        errors = out.splitlines()
+        if errors:
+            report["actions"].append(f"Recent CUPS errors: {errors[0][:200]}")
+
+    return report
+
+
+# ---- handle_scan (discover network printers via CUPS) ----------------------
+
+def handle_scan(params: dict) -> dict:
+    """
+    Quick scan using CUPS built-in discovery (lpinfo -v and avahi).
+    Less thorough than network_scan but faster.
+    """
+    printers = []
+
+    # 1. lpinfo -v for existing backends
+    backends = get_cups_backends()
+    for b in backends:
+        if b.startswith("ipp://") or b.startswith("ipps://") or b.startswith("lpd://"):
+            uri = b.split(":", 1)[1].strip() if ":" in b else b
+            printers.append({
+                "uri": uri,
+                "full_uri": b,
+                "source": "lpinfo",
+                "type": "network",
+            })
+        elif b.startswith("usb://"):
+            printers.append({
+                "uri": b.split(":", 1)[1].strip() if ":" in b else b,
+                "full_uri": b,
+                "source": "lpinfo",
+                "type": "usb",
+            })
+
+    # 2. Try avahi-browse for IPP printers
+    rc, out, _ = run_cmd(
+        ["avahi-browse", "-rt", "_ipp._tcp"], timeout=15
+    )
+    if rc == 0 and out:
+        for line in out.splitlines():
+            # avahi-browse -rt output includes lines like:
+            # =   eth0 IPv4 HP LaserJet        Internet Printer     local
+            # hostname = [HPxxxx.local]
+            # address = [192.168.1.50]
+            # port = [631]
+            # txt = [...]
+            if "address" in line.lower() and "=" in line:
+                m = re.search(r'address\s*=\s*\[([^\]]+)\]', line)
+                if m:
+                    ip = m.group(1)
+                    # Check if we already have this IP
+                    if not any(p.get("ip") == ip for p in printers):
+                        printers.append({
+                            "ip": ip,
+                            "uri": f"ipp://{ip}:631/ipp/print",
+                            "source": "avahi",
+                            "type": "network",
+                        })
+
+    return {"status": "ok", "printers": printers}
+
+
+# ---- handle_network_scan (thorough TCP + mDNS + HTTP probe) ---------------
+
+def handle_network_scan(params: dict) -> dict:
+    """
+    Thorough network scan for printers:
+      1. lpinfo -v (existing CUPS backends)
+      2. TCP scan on ports 631 + 9100 across /24 subnet (64 threads)
+      3. mDNS via avahi-browse _ipp._tcp
+      4. HTTP model probe for each discovered IP
+    Returns: {status: "ok", printers: [{ip, uri, model, source}, ...]}
+    """
+    printers = []
+    seen_ips = set()
+
+    # --- Phase 1: lpinfo -v backends ---
+    backends = get_cups_backends()
+    for b in backends:
+        if b.startswith("ipp://") or b.startswith("ipps://"):
+            uri = b.split(":", 1)[1].strip() if ":" in b else b
+            # Try to extract IP
+            ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', uri)
+            ip = ip_match.group(1) if ip_match else None
+            printers.append({
+                "ip": ip,
+                "uri": uri,
+                "full_uri": b,
+                "model": None,
+                "source": "lpinfo",
+            })
+            if ip:
+                seen_ips.add(ip)
+        elif b.startswith("lpd://"):
+            uri = b.split(":", 1)[1].strip() if ":" in b else b
+            ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', uri)
+            ip = ip_match.group(1) if ip_match else None
+            printers.append({
+                "ip": ip,
+                "uri": uri,
+                "full_uri": b,
+                "model": None,
+                "source": "lpinfo",
+            })
+            if ip:
+                seen_ips.add(ip)
+        elif b.startswith("usb://"):
+            printers.append({
+                "ip": None,
+                "uri": b.split(":", 1)[1].strip() if ":" in b else b,
+                "full_uri": b,
+                "model": None,
+                "source": "lpinfo-usb",
+            })
+
+    # --- Phase 2: TCP scan ---
+    subnet = params.get("subnet") or get_local_subnet()
+    if subnet:
+        tcp_results = scan_subnet_tcp(subnet)
+        for entry in tcp_results:
+            ip = entry["ip"]
+            if ip not in seen_ips:
+                seen_ips.add(ip)
+                printers.append({
+                    "ip": ip,
+                    "uri": f"ipp://{ip}:631/ipp/print",
+                    "model": None,
+                    "source": f"tcp-scan:port-{entry['port']}",
+                })
+    else:
+        log.warning("No subnet detected; skipping TCP scan")
+
+    # --- Phase 3: mDNS / avahi-browse ---
+    rc, out, _ = run_cmd(
+        ["avahi-browse", "-rt", "_ipp._tcp"], timeout=15
+    )
+    avahi_entries = {}
+    if rc == 0 and out:
+        current_name = None
+        for line in out.splitlines():
+            # Parse avahi-browse -rt output
+            if "=" in line and "IPv4" in line:
+                m_name = re.search(r'IPv4\s+(\S+)\s+', line)
+                if m_name:
+                    current_name = m_name.group(1)
+                    avahi_entries[current_name] = avahi_entries.get(current_name, {})
+            if current_name and "address" in line:
+                m = re.search(r'address\s*=\s*\[([^\]]+)\]', line)
+                if m:
+                    avahi_entries.setdefault(current_name, {})["ip"] = m.group(1)
+            if current_name and "port" in line:
+                m = re.search(r'port\s*=\s*\[([^\]]+)\]', line)
+                if m:
+                    avahi_entries.setdefault(current_name, {})["port"] = m.group(1)
+            if current_name and "txt" in line:
+                m = re.search(r'product=([^)\s]+)', line)
+                if m:
+                    avahi_entries.setdefault(current_name, {})["model"] = urllib.parse.unquote(m.group(1))
+
+    for name, info in avahi_entries.items():
+        ip = info.get("ip")
+        if not ip:
+            continue
+        if ip not in seen_ips:
+            seen_ips.add(ip)
+            port = info.get("port", "631")
+            printers.append({
+                "ip": ip,
+                "uri": f"ipp://{ip}:{port}/ipp/print",
+                "model": info.get("model"),
+                "source": "avahi-mdns",
             })
         else:
-            # Warn but continue — CUPS fix operations may still resolve queue issues
-            steps.append({
-                "step": "Network Check",
-                "status": "warning",
-                "message": (
-                    f"Printer at {printer_ip} did not respond to ping "
-                    f"(ICMP may be blocked). Proceeding with CUPS repair."
-                ),
-            })
-    else:
-        steps.append({
-            "step": "Network Check",
-            "status": "success",
-            "message": "Skipped network check (no IP known)",
-        })
+            # Enrich existing entry with model from mDNS
+            for p in printers:
+                if p.get("ip") == ip and not p.get("model") and info.get("model"):
+                    p["model"] = info["model"]
 
-    # Step 2: Enable the printer
-    rc_en, _, err_en = run_command(["cupsenable", printer_name])
-    if rc_en == 0:
-        steps.append({"step": "Enable Printer", "status": "success",
-                       "message": f"Enabled printer {printer_name}"})
-    else:
-        steps.append({"step": "Enable Printer", "status": "failed",
-                       "message": err_en or f"Failed to enable {printer_name}"})
+    # --- Phase 4: HTTP model probe for entries without a model ---
+    ips_to_probe = [
+        p for p in printers
+        if p.get("ip") and not p.get("model")
+    ]
 
-    # Step 2b: Accept jobs
-    rc_ac, _, err_ac = run_command(["cupsaccept", printer_name])
-    if rc_ac == 0:
-        steps.append({"step": "Accept Jobs", "status": "success",
-                       "message": f"Accepting jobs for {printer_name}"})
-    else:
-        steps.append({"step": "Accept Jobs", "status": "failed",
-                       "message": err_ac or f"Failed to accept jobs for {printer_name}"})
+    if ips_to_probe:
+        log.info("Probing %d IPs for model info", len(ips_to_probe))
 
-    # Step 2c: CUPS restart fallback
-    if rc_en != 0 or rc_ac != 0:
-        logger.warning("enable/accept failed for %s -- attempting CUPS restart", printer_name)
-        rc_cups, _, err_cups = run_command(["systemctl", "restart", "cups"], timeout=15)
-        if rc_cups == 0:
-            cups_ready = False
-            for _ in range(30):
-                try:
-                    s = socket.create_connection(("localhost", 631), timeout=0.2)
-                    s.close()
-                    cups_ready = True
-                    break
-                except OSError:
-                    time.sleep(0.2)
-            steps.append({"step": "Restart CUPS", "status": "success",
-                           "message": "CUPS restarted successfully"})
-            # Retry after restart
-            if rc_en != 0:
-                rc_en2, _, err_en2 = run_command(["cupsenable", printer_name])
-                steps.append({"step": "Re-enable Printer", "status": "success" if rc_en2 == 0 else "failed",
-                               "message": f"Enabled {printer_name} after restart" if rc_en2 == 0 else (err_en2 or "Re-enable failed")})
-            if rc_ac != 0:
-                rc_ac2, _, err_ac2 = run_command(["cupsaccept", printer_name])
-                steps.append({"step": "Re-accept Jobs", "status": "success" if rc_ac2 == 0 else "failed",
-                               "message": f"Accepting jobs for {printer_name} after restart" if rc_ac2 == 0 else (err_ac2 or "Re-accept failed")})
-        else:
-            steps.append({"step": "Restart CUPS", "status": "failed",
-                           "message": f"Failed to restart CUPS: {err_cups or 'unknown error'}"})
+        def _probe(entry):
+            model = http_probe_model(entry["ip"])
+            return entry["ip"], model
 
-    # Step 3: Clear stuck jobs
-    rc_cancel, out_cancel, err_cancel = run_command(["cancel", printer_name])
-    if rc_cancel == 0 or "no jobs" in (err_cancel or "").lower():
-        steps.append({"step": "Clear Stuck Jobs", "status": "success",
-                       "message": out_cancel or err_cancel or "No stuck jobs"})
-    else:
-        steps.append({"step": "Clear Stuck Jobs", "status": "failed",
-                       "message": err_cancel or f"Failed to clear jobs for {printer_name}"})
+        with ThreadPoolExecutor(max_workers=SCAN_PROBE_WORKERS) as pool:
+            futures = {pool.submit(_probe, e): e for e in ips_to_probe}
+            for fut in as_completed(futures):
+                ip, model = fut.result()
+                if model:
+                    for p in printers:
+                        if p.get("ip") == ip:
+                            p["model"] = model
 
-    # Step 4: Check driver
-    rc_lpstat, out_lpstat, _ = run_command(["lpstat", "-p", printer_name])
-    if rc_lpstat == 0:
-        steps.append({"step": "Check Driver", "status": "success",
-                       "message": f"Printer {printer_name} has valid configuration"})
-    else:
-        steps.append({"step": "Check Driver", "status": "failed",
-                       "message": "driver_needed"})
-        return {"status": "error", "steps": steps,
-                "message": "Printer needs driver installation (driver_needed)"}
-
-    all_ok = all(s["status"] == "success" for s in steps)
-    return {
-        "status": "ok" if all_ok else "error",
-        "steps": steps,
-        "message": "Printer fixed successfully" if all_ok else "Fixed with warnings",
-    }
+    log.info("Network scan complete: %d printers found", len(printers))
+    return {"status": "ok", "printers": printers}
 
 
-def handle_setup_printer(data: Dict[str, Any]) -> Dict[str, Any]:
+# ---- handle_setup_printer (IPP Everywhere → LPD → PPD → Kyocera) --------
+
+def handle_setup_printer(params: dict) -> dict:
     """
-    Set up a new printer in CUPS via lpadmin, enable it, and send a test page.
-    Supports PPD file and CUPS auto-detection (everywhere model).
+    Set up a network printer with automatic driver detection.
+    Strategy:
+      1. Try IPP Everywhere: lpadmin -p NAME -E -v ipp://IP:631/ipp/print -m everywhere
+      2. If fails, try LPD: lpadmin -p NAME -E -v lpd://IP/queue -m everywhere
+      3. If no driver, auto-detect PPD via lpinfo -m
+      4. If still no driver AND model contains Kyocera/ECOSYS, install Kyocera deb
+      5. Set defaults: InputSlot=One, Duplex=None
+      6. Enable + accept + set default
     """
-    name = sanitize_printer_name(data.get("name", "") or "")
-    ip = sanitize_ip(data.get("ip", "") or "")
-    model = data.get("model", "")
-    driver_path = data.get("driver_path", "")
+    name = params.get("name", "").strip()
+    ip = params.get("ip", "").strip()
+    model = params.get("model", "").strip()
+    uri = params.get("uri", "").strip()
+    set_default = params.get("set_default", True)
 
     if not name:
-        return {"status": "error", "message": "Invalid or missing printer name"}
-    if not ip:
-        return {"status": "error", "message": "Invalid or missing printer IP address"}
+        return {"status": "error", "message": "Printer name is required"}
+    if not ip and not uri:
+        return {"status": "error", "message": "IP address or URI is required"}
 
-    logger.info("Action: setup_printer -- name=%s ip=%s model=%s", name, ip, model)
-    steps: List[Dict[str, str]] = []
+    # Sanitize printer name (CUPS allows letters, digits, hyphens, underscores)
+    safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', name)
+    if safe_name != name:
+        log.info("Sanitized printer name: '%s' -> '%s'", name, safe_name)
+        name = safe_name
 
-    # Step 1: Network check — WARNING only, not fatal.
-    # Some printers block ICMP ping but still accept IPP connections.
-    # We warn the user but continue with installation.
-    rc, stdout, stderr = run_command(["ping", "-c", "2", "-W", "2", ip])
-    if rc == 0:
-        latency_match = re.search(
-            r'rtt\s+min/avg/max/mdev\s+=\s+[\d.]+/([\d.]+)/', stdout
-        )
-        latency = latency_match.group(1) if latency_match else "N/A"
-        steps.append({"step": "Network Check", "status": "success",
-                       "message": f"Printer connected -- latency {latency} ms"})
-    else:
-        # Do NOT abort — try installation anyway.
-        # Many printers (HP, Kyocera) block ICMP by default.
-        steps.append({"step": "Network Check", "status": "warning",
-                       "message": (
-                           f"Printer at {ip} did not respond to ping. "
-                           f"This is normal for some printers (ICMP may be blocked). "
-                           f"Attempting installation anyway."
-                       )})
+    # Build URIs
+    ipp_uri = f"ipp://{ip}:631/ipp/print" if ip else uri
+    lpd_uri = f"lpd://{ip}/queue" if ip else None
 
-    # Step 1b: Try to auto-detect driver via CUPS lpinfo if no PPD specified
-    auto_driver_type = ""
-    auto_driver_value = ""
-    if not driver_path:
-        auto_driver_value, auto_driver_type = _auto_detect_ppd(ip, name, model)
-        if auto_driver_type == "ppd_file":
-            driver_path = auto_driver_value
-            steps.append({"step": "Auto-detect Driver", "status": "success",
-                           "message": f"Found PPD file: {os.path.basename(auto_driver_value)}"})
-        elif auto_driver_type == "cups_model":
-            steps.append({"step": "Auto-detect Driver", "status": "success",
-                           "message": f"Found CUPS model: {auto_driver_value}"})
+    # If user provided a custom URI, use that
+    if uri and not ip:
+        ipp_uri = uri
+        lpd_uri = None
 
-    # Step 1c: PPD validation
-    if driver_path:
-        valid, validation_msg = validate_ppd_file(driver_path)
-        if not valid:
-            steps.append({"step": "PPD Validation", "status": "failed",
-                           "message": validation_msg})
-            # Don't fail completely - try everywhere model instead
-            driver_path = ""
-            steps.append({"step": "PPD Fallback", "status": "success",
-                           "message": "Falling back to CUPS everywhere model (IPP Everywhere)"})
-        else:
-            steps.append({"step": "PPD Validation", "status": "success",
-                           "message": validation_msg})
+    setup_report = {"status": "ok", "actions": [], "printer": name}
 
-    # Step 2: Create printer in CUPS
-    lpadmin_cmd = [
-        "lpadmin",
-        "-p", name,
-        "-E",
-        "-v", f"ipp://{ip}:631/ipp/print",
-    ]
+    # Remove existing printer with same name first
+    if is_printer_exists(name):
+        log.info("Printer '%s' already exists — removing first", name)
+        run_cmd(["lpadmin", "-x", name])
 
-    if driver_path and os.path.isfile(driver_path):
-        lpadmin_cmd.extend(["-P", driver_path])
-        logger.info("Using PPD file: %s", driver_path)
-    elif auto_driver_type == "cups_model" and auto_driver_value:
-        # Use the auto-detected CUPS model name (e.g. "drv:///hp/hp-laserjet_4015.ppd")
-        lpadmin_cmd.extend(["-m", auto_driver_value])
-        logger.info("Using CUPS model: %s", auto_driver_value)
-    else:
-        # CUPS everywhere model (IPP Everywhere - auto-detect via CUPS)
-        lpadmin_cmd.extend(["-m", "everywhere"])
-        logger.info("Using CUPS everywhere model (IPP Everywhere auto-detect)")
-
-    rc_lp, _, err_lp = run_command(lpadmin_cmd)
-    if rc_lp == 0:
-        steps.append({"step": "Add Printer to CUPS", "status": "success",
-                       "message": f"Created printer '{name}' via lpadmin"})
-    else:
-        # If everywhere model failed, try with lpd:// URI
-        if not driver_path:
-            lpd_cmd = [
-                "lpadmin",
-                "-p", name,
-                "-E",
-                "-v", f"lpd://{ip}/queue",
-                "-m", "everywhere",
-            ]
-            rc_lpd, _, err_lpd = run_command(lpd_cmd)
-            if rc_lpd == 0:
-                steps.append({"step": "Add Printer to CUPS", "status": "success",
-                               "message": f"Created printer '{name}' via LPD fallback"})
-            else:
-                steps.append({"step": "Add Printer to CUPS", "status": "failed",
-                               "message": err_lp or f"lpadmin failed for '{name}'"})
-                return {"status": "error", "steps": steps,
-                        "message": f"Failed to add printer: {err_lp}"}
-        else:
-            steps.append({"step": "Add Printer to CUPS", "status": "failed",
-                           "message": err_lp or f"lpadmin failed for '{name}'"})
-            return {"status": "error", "steps": steps,
-                    "message": f"Failed to add printer: {err_lp}"}
-
-    # Step 3: Enable
-    rc_en, _, err_en = run_command(["cupsenable", name])
-    steps.append({"step": "Enable Printer", "status": "success" if rc_en == 0 else "failed",
-                   "message": f"Enabled {name}" if rc_en == 0 else (err_en or f"Failed to enable {name}")})
-
-    # Step 4: Accept jobs
-    rc_ac, _, err_ac = run_command(["cupsaccept", name])
-    steps.append({"step": "Accept Jobs", "status": "success" if rc_ac == 0 else "failed",
-                   "message": f"Accepting jobs for {name}" if rc_ac == 0 else (err_ac or f"Failed to accept jobs")})
-
-    # Step 5: Set as default
-    rc_def, _, err_def = run_command(["lpadmin", "-d", name])
-    steps.append({"step": "Set as Default", "status": "success" if rc_def == 0 else "failed",
-                   "message": f"Set '{name}' as default" if rc_def == 0 else (err_def or "Failed to set default")})
-
-    # Step 5b: Paper feed + Duplex defaults (from Printers-Tools)
-    _set_network_printer_defaults(name)
-    steps.append({"step": "Paper Feed Defaults", "status": "success",
-                   "message": "Set InputSlot=One, Duplex=None"})
-
-    # Step 6: Test print
-    if os.path.isfile(TEST_PRINT_FILE):
-        rc_tp, out_tp, err_tp = run_command([
-            "lp", "-d", name, "-o", "fit-to-page", TEST_PRINT_FILE,
-        ])
-        steps.append({"step": "Test Print", "status": "success" if rc_tp == 0 else "failed",
-                       "message": (out_tp or f"Sent test page to '{name}'") if rc_tp == 0 else (err_tp or "Test print failed")})
-    else:
-        steps.append({"step": "Test Print", "status": "skipped",
-                       "message": f"Test file not found: {TEST_PRINT_FILE}"})
-
-    all_ok = all(s["status"] in ("success", "skipped") for s in steps)
-    return {
-        "status": "ok" if all_ok else "error",
-        "steps": steps,
-        "message": f"Printer '{name}' set up successfully" if all_ok else "Setup with warnings",
-    }
-
-
-def _auto_detect_ppd(ip: str, printer_name: str, model_hint: str) -> Tuple[str, str]:
-    """
-    Try to auto-detect a PPD driver for a network printer using CUPS lpinfo.
-
-    Returns a tuple (ppd_path_or_model, driver_type):
-      driver_type = "ppd_file"  -> first element is an absolute path to a PPD file
-      driver_type = "cups_model" -> first element is a CUPS model name (use with lpadmin -m)
-      driver_type = "" -> no match found, fall back to IPP Everywhere
-    """
-    logger.info("Auto-detecting PPD for %s (ip=%s, model=%s)", printer_name, ip, model_hint)
-
-    # Try lpinfo -m to find matching models
-    rc, stdout, stderr = run_command(["lpinfo", "-m"], timeout=15)
-    if rc != 0:
-        logger.warning("lpinfo -m failed: %s", stderr)
-        return "", ""
-
-    # If we have a model hint, try to match it
-    if model_hint:
-        model_lower = model_hint.lower()
-        # Prioritise exact / high-quality matches
-        best_match: Optional[Tuple[str, str]] = None
-        for line in stdout.splitlines():
-            parts = line.strip().split(None, 1)
-            if len(parts) >= 2:
-                ppd_name = parts[0]
-                ppd_desc = parts[1].lower() if len(parts) > 1 else ""
-                # Check if model name matches
-                if model_lower in ppd_desc or model_lower.replace(" ", "") in ppd_desc.replace(" ", ""):
-                    if ppd_name.startswith("/"):
-                        # Absolute path PPD file — best possible match
-                        logger.info("Found PPD file: %s (%s)", ppd_name, ppd_desc)
-                        return ppd_name, "ppd_file"
-                    # CUPS model name — return it so setup_printer can use -m <model>
-                    if best_match is None:
-                        best_match = (ppd_name, ppd_desc)
-
-        if best_match:
-            logger.info("Found CUPS model: %s (%s)", best_match[0], best_match[1])
-            return best_match[0], "cups_model"
-
-    # No match found - CUPS everywhere model will be used
-    return "", ""
-
-
-def handle_clear_jobs(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Cancel all jobs for a given printer."""
-    printer_name = sanitize_printer_name(data.get("printer_name", "") or "")
-    if not printer_name:
-        return {"status": "error", "message": "Invalid or missing printer name"}
-
-    logger.info("Action: clear_jobs -- printer=%s", printer_name)
-
-    rc_count, out_count, _ = run_command(["lpstat", "-o", printer_name])
-    cleared = len(out_count.strip().splitlines()) if rc_count == 0 and out_count.strip() else 0
-
-    rc, stdout, stderr = run_command(["cancel", printer_name])
-    if rc == 0 or "no jobs" in (stderr or "").lower() or cleared == 0:
-        return {"status": "ok", "cleared": cleared}
-    else:
-        return {"status": "error", "cleared": 0,
-                "message": stderr or "Failed to clear jobs"}
-
-
-def handle_test_print(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Send a test print job to a printer."""
-    printer_name = sanitize_printer_name(data.get("printer_name", "") or "")
-    if not printer_name:
-        return {"status": "error", "message": "Invalid or missing printer name"}
-
-    logger.info("Action: test_print -- printer=%s", printer_name)
-
-    if not os.path.isfile(TEST_PRINT_FILE):
-        return {"status": "error", "message": f"Test file not found: {TEST_PRINT_FILE}"}
-
-    rc, stdout, stderr = run_command([
-        "lp", "-d", printer_name, "-o", "fit-to-page", TEST_PRINT_FILE,
-    ])
-    if rc == 0:
-        return {"status": "ok", "message": f"Sent test page to '{printer_name}': {stdout}"}
-    else:
-        return {"status": "error", "message": f"Test print failed: {stderr}"}
-
-
-# ---------------------------------------------------------------------------
-# USB Thermal Printer Support
-# ---------------------------------------------------------------------------
-
-
-def _detect_usb_printer_uris() -> List[Dict[str, str]]:
-    """Detect USB printers by running lpinfo -v and filtering for USB URIs."""
-    usb_printers: List[Dict[str, str]] = []
-    rc, stdout, stderr = run_command(["lpinfo", "-v"], timeout=15)
-    if rc != 0:
-        logger.warning("lpinfo -v failed: %s", stderr)
-        return usb_printers
-
-    for line in stdout.splitlines():
-        line = line.strip()
-        if line.startswith("direct usb://") or "usb://" in line:
-            parts = line.split(None, 1)
-            uri = parts[-1].strip() if parts else ""
-            if uri.startswith("usb://"):
-                desc = uri.replace("usb://", "").rstrip("/")
-                usb_printers.append({"uri": uri, "description": desc})
-
-    return usb_printers
-
-
-def _match_thermal_ppd(usb_desc: str) -> Optional[str]:
-    """Find a matching thermal PPD file for a USB printer description."""
-    desc_lower = usb_desc.lower()
-
-    ppd_map = {
-        "58mm": "58mmSeries.ppd.gz",
-        "76mm": "76mmSeries.ppd.gz",
-        "80mm": "80mmSeries.ppd.gz",
-        "112mm": "112mmSeries.ppd.gz",
-        "t5": "T5.ppd.gz",
-    }
-
-    for keyword, ppd_filename in ppd_map.items():
-        if keyword.lower() in desc_lower:
-            ppd_path = os.path.join(THERMAL_PPD_DIR, ppd_filename)
-            if os.path.isfile(ppd_path):
-                return ppd_path
-
-    # Default: try 80mm
-    default_ppd = os.path.join(THERMAL_PPD_DIR, "80mmSeries.ppd.gz")
-    if os.path.isfile(default_ppd):
-        return default_ppd
-
-    # Last resort: first available PPD
-    for ppd_filename in THERMAL_PPD_FILES:
-        ppd_path = os.path.join(THERMAL_PPD_DIR, ppd_filename)
-        if os.path.isfile(ppd_path):
-            return ppd_path
-
-    return None
-
-
-def handle_setup_thermal_usb(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Set up a USB thermal printer.
-    Accepts both "usb_uri" and "device_uri" parameters.
-    Uses PPD file if available, falls back to CUPS auto-detect.
-    """
-    logger.info("Action: setup_thermal_usb")
-
-    usb_uri_param = data.get("usb_uri", "") or data.get("device_uri", "")
-
-    # Check if thermal driver PPDs are installed
-    any_ppd_found = any(
-        os.path.isfile(os.path.join(THERMAL_PPD_DIR, f))
-        for f in THERMAL_PPD_FILES
+    # --- Attempt 1: IPP Everywhere ---
+    log.info("Attempt 1: IPP Everywhere for %s at %s", name, ipp_uri)
+    rc, out, err = run_cmd(
+        ["lpadmin", "-p", name, "-E", "-v", ipp_uri, "-m", "everywhere"],
+        timeout=30,
     )
-
-    steps: List[Dict[str, str]] = []
-
-    # Step 1: Detect USB printers
-    usb_printers = _detect_usb_printer_uris()
-    if not usb_printers:
-        steps.append({"step": "Detect USB Printers", "status": "failed",
-                       "message": "No USB printers detected. Connect a USB printer and try again."})
-        return {"status": "error", "steps": steps,
-                "message": "No USB printers found", "detected_usb_printers": []}
-
-    # Use specified URI or pick the first detected
-    specified_uri = usb_uri_param
-    selected_printer: Optional[Dict[str, str]] = None
-
-    if specified_uri:
-        for p in usb_printers:
-            if p["uri"] == specified_uri:
-                selected_printer = p
-                break
-        if not selected_printer:
-            steps.append({"step": "Detect USB Printers", "status": "failed",
-                           "message": f"Specified URI not found: {specified_uri}"})
-            return {"status": "error", "steps": steps,
-                    "message": "Specified URI not found",
-                    "detected_usb_printers": usb_printers}
+    if rc == 0:
+        setup_report["actions"].append(f"Set up via IPP Everywhere: {ipp_uri}")
+        log.info("IPP Everywhere setup succeeded for %s", name)
     else:
-        selected_printer = usb_printers[0]
+        log.warning("IPP Everywhere failed: %s", err)
 
-    usb_uri = selected_printer["uri"]
-    usb_desc = selected_printer["description"]
-
-    steps.append({"step": "Detect USB Printers", "status": "success",
-                   "message": f"Found {len(usb_printers)} USB printer(s), selected: {usb_desc}"})
-
-    # Step 2: Generate printer name
-    raw_name = data.get("printer_name", "")
-    if raw_name:
-        printer_name = sanitize_printer_name(raw_name)
-    else:
-        base_name = usb_desc.replace("/", "_").replace(" ", "_")
-        base_name = re.sub(r'[^a-zA-Z0-9_\-.]', '', base_name)[:60]
-        printer_name = sanitize_printer_name(base_name) or "thermal_usb_printer"
-
-    logger.info("Thermal USB setup: name=%s uri=%s", printer_name, usb_uri)
-
-    # Step 3: Match PPD file (or use CUPS auto-detect)
-    ppd_path = ""
-    ppd_filename = ""
-
-    if any_ppd_found:
-        specified_ppd = data.get("ppd_file", "")
-        if specified_ppd:
-            specified_ppd = os.path.basename(specified_ppd)  # Prevent path traversal
-            ppd_path = os.path.join(THERMAL_PPD_DIR, specified_ppd)
-            if not os.path.isfile(ppd_path):
-                ppd_path = ""
-                steps.append({"step": "Select PPD", "status": "failed",
-                               "message": f"Specified PPD not found: {specified_ppd}"})
-
-        if not ppd_path:
-            ppd_path = _match_thermal_ppd(usb_desc)
-
-        if ppd_path:
-            ppd_filename = os.path.basename(ppd_path)
-            # Validate PPD
-            valid_ppd, ppd_msg = validate_ppd_file(ppd_path)
-            if valid_ppd:
-                steps.append({"step": "Select PPD", "status": "success",
-                               "message": f"Using PPD: {ppd_filename}"})
+        # --- Attempt 2: LPD + everywhere ---
+        if lpd_uri:
+            log.info("Attempt 2: LPD for %s at %s", name, lpd_uri)
+            rc, out, err = run_cmd(
+                ["lpadmin", "-p", name, "-E", "-v", lpd_uri, "-m", "everywhere"],
+                timeout=30,
+            )
+            if rc == 0:
+                setup_report["actions"].append(f"Set up via LPD Everywhere: {lpd_uri}")
+                log.info("LPD Everywhere setup succeeded for %s", name)
             else:
-                steps.append({"step": "Select PPD", "status": "failed",
-                               "message": f"PPD invalid: {ppd_msg}. Falling back to CUPS auto-detect."})
-                ppd_path = ""
-                ppd_filename = ""
+                log.warning("LPD Everywhere failed: %s", err)
 
-    if not ppd_path:
-        steps.append({"step": "Driver Method", "status": "success",
-                       "message": "Using CUPS auto-detection (IPP Everywhere / raw)"})
+        # --- Attempt 3: Find PPD via lpinfo ---
+        if rc != 0 or not is_printer_exists(name):
+            search_model = model or name
+            log.info("Attempt 3: Searching PPD for model '%s'", search_model)
+            ppd = find_ppd_for_model(search_model)
 
-    # Step 4: Install printer via lpadmin
-    lpadmin_cmd = ["lpadmin", "-p", printer_name, "-E", "-v", usb_uri]
-    if ppd_path:
-        lpadmin_cmd.extend(["-P", ppd_path])
-    else:
-        # Try raw queue first for thermal, then everywhere
-        lpadmin_cmd.extend(["-m", "raw"])
-
-    rc_lp, _, err_lp = run_command(lpadmin_cmd)
-    if rc_lp != 0:
-        # If raw failed, try everywhere
-        if not ppd_path:
-            lpadmin_cmd_fallback = ["lpadmin", "-p", printer_name, "-E", "-v", usb_uri, "-m", "everywhere"]
-            rc_lp2, _, err_lp2 = run_command(lpadmin_cmd_fallback)
-            if rc_lp2 == 0:
-                steps.append({"step": "Add Thermal Printer to CUPS", "status": "success",
-                               "message": f"Created thermal printer '{printer_name}' (auto-detect mode)"})
-                rc_lp = 0
+            if ppd:
+                use_uri = ipp_uri
+                log.info("Found PPD: %s", ppd)
+                rc, out, err = run_cmd(
+                    ["lpadmin", "-p", name, "-E", "-v", use_uri, "-m", ppd],
+                    timeout=30,
+                )
+                if rc == 0:
+                    setup_report["actions"].append(f"Set up with PPD: {ppd}")
+                    log.info("PPD setup succeeded for %s", name)
+                else:
+                    log.warning("PPD setup failed: %s", err)
             else:
-                steps.append({"step": "Add Thermal Printer to CUPS", "status": "failed",
-                               "message": err_lp or f"lpadmin failed for thermal printer '{printer_name}'"})
-        else:
-            steps.append({"step": "Add Thermal Printer to CUPS", "status": "failed",
-                           "message": err_lp or f"lpadmin failed for '{printer_name}'"})
-    else:
-        steps.append({"step": "Add Thermal Printer to CUPS", "status": "success",
-                       "message": f"Created thermal printer '{printer_name}' with PPD {ppd_filename or 'auto'}"})
+                log.info("No PPD found for '%s'", search_model)
 
-    if rc_lp != 0:
-        return {"status": "error", "steps": steps,
-                "message": f"Failed to add thermal printer: {err_lp}"}
+                # --- Attempt 4: Kyocera auto-install ---
+                model_lower = (model or name).lower()
+                if "kyocera" in model_lower or "ecosys" in model_lower:
+                    log.info("Attempt 4: Kyocera driver auto-install")
+                    if install_kyocera_driver():
+                        # Re-search for PPD after installation
+                        time.sleep(2)  # Give CUPS time to pick up new PPDs
+                        ppd = find_ppd_for_model(model or name)
+                        if ppd:
+                            use_uri = ipp_uri
+                            rc, out, err = run_cmd(
+                                ["lpadmin", "-p", name, "-E", "-v", use_uri, "-m", ppd],
+                                timeout=30,
+                            )
+                            if rc == 0:
+                                setup_report["actions"].append(
+                                    f"Installed Kyocera driver, set up with PPD: {ppd}"
+                                )
+                            else:
+                                setup_report["actions"].append(
+                                    f"Kyocera driver installed but PPD setup failed: {err}"
+                                )
+                        else:
+                            setup_report["actions"].append(
+                                "Kyocera driver installed but no matching PPD found"
+                            )
+                    else:
+                        setup_report["actions"].append("Kyocera driver installation failed")
 
-    # Step 5: Enable
-    rc_en, _, err_en = run_command(["cupsenable", printer_name])
-    steps.append({"step": "Enable Thermal Printer", "status": "success" if rc_en == 0 else "failed",
-                   "message": f"Enabled {printer_name}" if rc_en == 0 else (err_en or "Failed to enable")})
+        # Final check — if still not created, try with raw driver
+        if not is_printer_exists(name):
+            log.info("Final attempt: raw driver for %s", name)
+            use_uri = ipp_uri or lpd_uri
+            rc, out, err = run_cmd(
+                ["lpadmin", "-p", name, "-E", "-v", use_uri, "-m", "raw"],
+                timeout=30,
+            )
+            if rc == 0:
+                setup_report["actions"].append("Set up with raw driver (no PPD)")
+            else:
+                setup_report["status"] = "error"
+                setup_report["actions"].append(f"All setup methods failed: {err}")
+                return setup_report
 
-    # Step 6: Accept jobs
-    rc_ac, _, err_ac = run_command(["cupsaccept", printer_name])
-    steps.append({"step": "Accept Jobs", "status": "success" if rc_ac == 0 else "failed",
-                   "message": f"Accepting jobs for {printer_name}" if rc_ac == 0 else (err_ac or "Failed to accept jobs")})
+    # Set common defaults
+    run_cmd(["lpadmin", "-p", name, "-o", "InputSlot=One"])
+    run_cmd(["lpadmin", "-p", name, "-o", "Duplex=None"])
+    run_cmd(["lpadmin", "-p", name, "-o", "media=a4"])
 
-    # Step 7: Set as default
-    rc_def, _, err_def = run_command(["lpadmin", "-d", printer_name])
-    steps.append({"step": "Set as Default", "status": "success" if rc_def == 0 else "failed",
-                   "message": f"Set '{printer_name}' as default" if rc_def == 0 else (err_def or "Failed to set default")})
+    # Enable and accept
+    run_cmd(["cupsenable", name])
+    run_cmd(["cupsaccept", name])
 
-    # Step 8: Test print
-    if os.path.isfile(TEST_PRINT_FILE):
-        rc_tp, out_tp, err_tp = run_command([
-            "lp", "-d", printer_name, "-o", "fit-to-page", TEST_PRINT_FILE,
-        ])
-        steps.append({"step": "Test Print", "status": "success" if rc_tp == 0 else "failed",
-                       "message": (out_tp or f"Sent test page to '{printer_name}'") if rc_tp == 0 else (err_tp or "Test print failed")})
-    else:
-        steps.append({"step": "Test Print", "status": "skipped",
-                       "message": f"Test file not found: {TEST_PRINT_FILE}"})
+    # Set as default if requested
+    if set_default:
+        run_cmd(["lpadmin", "-d", name])
+        setup_report["actions"].append("Set as default printer")
 
-    all_ok = all(s["status"] in ("success", "skipped") for s in steps)
-    return {
-        "status": "ok" if all_ok else "error",
-        "printer_name": printer_name,
-        "usb_uri": usb_uri,
-        "ppd_used": ppd_filename or "auto-detect",
-        "steps": steps,
-        "message": f"Thermal printer '{printer_name}' set up successfully" if all_ok else "Setup with warnings",
-    }
-
-
-# ---------------------------------------------------------------------------
-# Thermal Driver Install Handler
-# ---------------------------------------------------------------------------
-
-
-def handle_install_thermal_driver(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Download and install the thermal printer driver from GitHub."""
-    logger.info("Action: install_thermal_driver")
-
-    steps: List[Dict[str, str]] = []
-
-    # Step 1: Check for libusb
-    rc_libusb, out_libusb, _ = run_command(["dpkg", "-l", "libusb-1.0-0"], timeout=5)
-    if rc_libusb == 0 and "ii" in (out_libusb or ""):
-        steps.append({"step": "Check libusb", "status": "success",
-                       "message": "libusb-1.0-0 is installed"})
-    else:
-        rc_apt, _, err_apt = run_command(["apt-get", "install", "-y", "libusb-1.0-0"], timeout=60)
-        if rc_apt == 0:
-            steps.append({"step": "Check libusb", "status": "success",
-                           "message": "Installed libusb-1.0-0 via apt-get"})
-        else:
-            steps.append({"step": "Check libusb", "status": "failed",
-                           "message": f"libusb not installed and apt-get failed: {err_apt}"})
-            return {"status": "error", "steps": steps,
-                    "message": "libusb unavailable. Install manually: apt-get install libusb-1.0-0"}
-
-    # Step 2: Create temp directory
-    try:
-        tmp_dir = tempfile.mkdtemp(prefix="it-aman-thermal-")
-        steps.append({"step": "Create Temp Directory", "status": "success",
-                       "message": f"Created: {tmp_dir}"})
-    except OSError as exc:
-        steps.append({"step": "Create Temp Directory", "status": "failed",
-                       "message": f"Failed: {exc}"})
-        return {"status": "error", "steps": steps, "message": "Failed to create temp directory"}
-
-    # Step 3: Download all driver files from GitHub with SHA256 verification
-    download_success = True
-    downloaded_files: List[str] = []
-    for filename in THERMAL_DRIVER_FILES:
-        url = f"{RAW_BASE}/thermal/{filename}"
-        dest = os.path.join(tmp_dir, filename)
-        success = _download_file_verified(url, dest, timeout=60)
-        if success:
-            downloaded_files.append(filename)
-            if filename.endswith(".sh") or filename.startswith("rastertoprinter"):
-                try:
-                    os.chmod(dest, 0o755)
-                except OSError:
-                    pass
-        else:
-            download_success = False
-            steps.append({"step": f"Download {filename}", "status": "failed",
-                           "message": f"Failed to download {filename}"})
-
-    if download_success:
-        steps.append({"step": "Download Driver Files", "status": "success",
-                       "message": f"Downloaded {len(downloaded_files)} files: {', '.join(downloaded_files)}"})
-    else:
-        # Partial download - try to continue with what we have
-        if len(downloaded_files) >= 3:
-            steps.append({"step": "Download Driver Files", "status": "success",
-                           "message": f"Downloaded {len(downloaded_files)}/{len(THERMAL_DRIVER_FILES)} files (partial)"})
-        else:
-            try:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            except Exception:
-                pass
-            return {"status": "error", "steps": steps,
-                    "message": "Failed to download driver files. Check internet connection."}
-
-    # Step 4: Run install.sh
-    install_script = os.path.join(tmp_dir, "install.sh")
-    if os.path.isfile(install_script):
-        rc_install, out_install, err_install = run_command(
-            ["bash", install_script], timeout=120,
-        )
-        if rc_install == 0:
-            steps.append({"step": "Run install.sh", "status": "success",
-                           "message": out_install or "install.sh completed successfully"})
-        else:
-            steps.append({"step": "Run install.sh", "status": "failed",
-                           "message": err_install or f"install.sh failed (exit code {rc_install})"})
-    else:
-        steps.append({"step": "Run install.sh", "status": "failed",
-                       "message": "install.sh not found in downloaded files"})
-
-    # Step 5: Verify installation
-    installed_ppds: List[str] = []
-    missing_ppds: List[str] = []
-    for ppd in THERMAL_PPD_FILES:
-        ppd_path = os.path.join(THERMAL_PPD_DIR, ppd)
-        if os.path.isfile(ppd_path):
-            installed_ppds.append(ppd)
-        else:
-            missing_ppds.append(ppd)
-
-    if installed_ppds:
-        steps.append({"step": "Verify Installation", "status": "success" if not missing_ppds else "partial",
-                       "message": f"PPD files: {', '.join(installed_ppds)}. {'All verified.' if not missing_ppds else 'Missing: ' + ', '.join(missing_ppds)}"})
-    else:
-        steps.append({"step": "Verify Installation", "status": "failed",
-                       "message": f"No PPD files found in {THERMAL_PPD_DIR}"})
-
-    # Clean up
-    try:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-    except Exception:
-        pass
-
-    all_ok = all(s["status"] == "success" for s in steps)
-    return {
-        "status": "ok" if all_ok else "error",
-        "steps": steps,
-        "installed_ppds": installed_ppds,
-        "missing_ppds": missing_ppds,
-        "message": "Thermal driver installed successfully" if all_ok else "Installation with warnings",
-    }
+    setup_report["actions"].append("Setup complete")
+    return setup_report
 
 
-# ---------------------------------------------------------------------------
-# USB Printer Detection Handler
-# ---------------------------------------------------------------------------
+# ---- handle_install_thermal_brand -----------------------------------------
 
-
-def handle_detect_usb_printers(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Detect all USB printers connected to the system."""
-    logger.info("Action: detect_usb_printers")
-
-    steps: List[Dict[str, str]] = []
-
-    usb_printers = _detect_usb_printer_uris()
-
-    # Check lsusb for additional info
-    rc_lsusb, out_lsusb, _ = run_command(["lsusb"], timeout=10)
-    lsusb_lines: List[str] = []
-    if rc_lsusb == 0:
-        printer_keywords = ["printer", "print", "thermal", "pos", "receipt"]
-        for line in out_lsusb.splitlines():
-            if any(kw in line.lower() for kw in printer_keywords):
-                lsusb_lines.append(line.strip())
-
-    # Cross-reference with configured printers
-    rc_lpstat, out_lpstat, _ = run_command(["lpstat", "-v"], timeout=10)
-    configured_uris: Dict[str, str] = {}
-    if rc_lpstat == 0:
-        for line in out_lpstat.splitlines():
-            m = re.match(r'^device for\s+(\S+):\s+(.+)$', line.strip())
-            if m:
-                configured_uris[m.group(2).strip()] = m.group(1)
-
-    enriched_printers: List[Dict[str, Any]] = []
-    for p in usb_printers:
-        uri = p["uri"]
-        enriched = {
-            "uri": uri,
-            "description": p["description"],
-            "configured": uri in configured_uris,
-        }
-        if uri in configured_uris:
-            enriched["configured_as"] = configured_uris[uri]
-        enriched_printers.append(enriched)
-
-    steps.append({"step": "Detect USB Printers", "status": "success",
-                   "message": f"Found {len(usb_printers)} USB printer(s)"})
-
-    return {
-        "status": "ok",
-        "usb_printers": enriched_printers,
-        "lsusb_printers": lsusb_lines,
-        "steps": steps,
-        "message": f"Found {len(usb_printers)} USB printer(s)",
-    }
-
-
-# ---------------------------------------------------------------------------
-# Printer Details Handler
-# ---------------------------------------------------------------------------
-
-
-def handle_get_printer_details(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Get detailed information about a specific printer from CUPS."""
-    printer_name = sanitize_printer_name(data.get("printer_name", "") or "")
-    if not printer_name:
-        return {"status": "error", "message": "Invalid or missing printer name"}
-
-    logger.info("Action: get_printer_details -- printer=%s", printer_name)
-
-    details: Dict[str, Any] = {"name": printer_name}
-
-    # 1. Printer status
-    rc_p, out_p, err_p = run_command(["lpstat", "-p", printer_name])
-    if rc_p == 0 and out_p.strip():
-        details["status_raw"] = out_p.strip()
-        m = re.match(r'^printer\s+\S+\s+(?:is\s+)?(.+?)(?:\.\s|$)', out_p.strip())
-        details["state"] = m.group(1).strip() if m else out_p.strip()
-    else:
-        details["state"] = "not_installed"
-        details["status_raw"] = err_p or "Printer not found in CUPS"
-
-    # 2. Default printer
-    rc_d, out_d, _ = run_command(["lpstat", "-d"])
-    if rc_d == 0:
-        m_default = re.search(r'default destination:\s*(.+)$', out_d)
-        default_name = m_default.group(1).strip() if m_default else ""
-        details["is_default"] = (default_name == printer_name)
-    else:
-        details["is_default"] = False
-
-    # 3. Device URI
-    rc_v, out_v, _ = run_command(["lpstat", "-v", printer_name])
-    if rc_v == 0 and out_v.strip():
-        m_uri = re.search(r':\s*(.+)$', out_v.strip())
-        details["device_uri"] = m_uri.group(1).strip() if m_uri else out_v.strip()
-    else:
-        details["device_uri"] = ""
-
-    # 4. Job count
-    rc_o, out_o, _ = run_command(["lpstat", "-o", printer_name])
-    if rc_o == 0 and out_o.strip():
-        details["jobs_count"] = len(out_o.strip().splitlines())
-    else:
-        details["jobs_count"] = 0
-
-    # 5. Accepting status
-    rc_a, out_a, _ = run_command(["lpstat", "-a", printer_name])
-    if rc_a == 0 and out_a.strip():
-        m_accept = re.search(r'(accepting|rejecting)', out_a.strip())
-        details["accepting"] = (m_accept.group(1) == "accepting") if m_accept else False
-    else:
-        details["accepting"] = False
-
-    # 6. Check if USB/thermal
-    uri = details.get("device_uri", "")
-    details["is_usb"] = uri.startswith("usb://") if uri else False
-    details["is_network"] = bool(uri and any(p in uri for p in ("ipp://", "http://", "socket://")))
-
-    return {"status": "ok", **details}
-
-
-# ---------------------------------------------------------------------------
-# SHA256 Manifest Verification for Secure Updates
-# ---------------------------------------------------------------------------
-
-
-def _compute_sha256(file_path: str) -> str:
-    """Compute SHA256 hash of a file."""
-    h = hashlib.sha256()
-    try:
-        with open(file_path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except Exception:
-        return ""
-
-
-def _verify_manifest_signature(manifest: Dict[str, Any]) -> bool:
+def handle_install_thermal_brand(params: dict) -> dict:
     """
-    Verify the Ed25519 signature of an update manifest.
+    Install a thermal printer brand driver.
+    Supported brands: "xprinter" (XP-80) and "sprt" (SPRT).
 
-    The manifest is signed with the developer's private Ed25519 key.  Only the
-    public key is embedded in this file, so an attacker who reads the source
-    cannot forge a valid signature — unlike HMAC where the shared secret would
-    be exposed in a public repository.
+    XPrinter (XP-80):
+      - Download binary from Dropbox, chmod +x, run it
+      - Find PPD via lpinfo
+      - lpadmin with USB URI
 
-    Returns True only if the signature is valid.
+    SPRT:
+      - Download zip from Dropbox, extract, run install.sh
+      - Copy filters (rastertoprinter)
+      - Find 80mmSeries.ppd, patch FullCut default
+      - lpadmin with USB URI and -P flag
     """
-    import base64
-    try:
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-        from cryptography.hazmat.primitives.asymmetric.utils import (
-            Prehashed,
-        )
-        from cryptography.exceptions import InvalidSignature
-    except ImportError:
-        logger.error(
-            "cryptography package is required for manifest verification. "
-            "Install with: pip3 install cryptography"
-        )
-        return False
+    brand = params.get("brand", "").strip().lower()
 
-    signature_b64 = manifest.get("signature", "")
-    if not signature_b64:
-        logger.error("Manifest has NO signature -- rejecting (unsigned manifests are not allowed)")
-        return False
-
-    try:
-        signature_bytes = base64.b64decode(signature_b64)
-    except Exception:
-        logger.error("Manifest signature is not valid base64")
-        return False
-
-    # Reconstruct the data that was signed: manifest without the signature key,
-    # JSON-serialised with sorted keys (same canonical form as generate_manifest.py)
-    manifest_copy = {k: v for k, v in manifest.items() if k != "signature"}
-    manifest_json = json.dumps(manifest_copy, sort_keys=True, ensure_ascii=False)
-    message_bytes = manifest_json.encode("utf-8")
-
-    try:
-        pub_key_bytes = base64.b64decode(_MANIFEST_PUBLIC_KEY_B64)
-        public_key = Ed25519PublicKey.from_public_bytes(pub_key_bytes)
-        public_key.verify(signature_bytes, message_bytes)
-        logger.info("Manifest Ed25519 signature verified successfully")
-        return True
-    except InvalidSignature:
-        logger.error("Manifest Ed25519 signature verification FAILED — possible tampering!")
-        return False
-    except Exception as exc:
-        logger.error("Manifest signature verification error: %s", exc)
-        return False
-
-
-def _download_file_verified(url: str, dest: str, timeout: int = 30,
-                            expected_hash: str = "") -> bool:
-    """
-    Download a file with SHA256 verification.
-    If expected_hash is provided, verifies the downloaded file matches.
-    Returns True on success.
-    """
-    try:
-        req = urllib.request.Request(url)
-        req.add_header("User-Agent", "IT-Aman/3.0")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            content = resp.read()
-
-        if len(content) < 50:
-            logger.error("Downloaded file too small (%d bytes): %s", len(content), url)
-            return False
-
-        # Verify SHA256 if expected hash provided
-        actual_hash = hashlib.sha256(content).hexdigest()
-        if expected_hash and actual_hash != expected_hash:
-            logger.error("SHA256 mismatch for %s: expected %s, got %s",
-                         url, expected_hash[:16], actual_hash[:16])
-            return False
-
-        # Write atomically
-        tmp = dest + ".tmp"
-        with open(tmp, "wb") as f:
-            f.write(content)
-        os.replace(tmp, dest)
-        logger.info("Downloaded %s -> %s (%d bytes, sha256=%s...)",
-                     url, dest, len(content), actual_hash[:16])
-        return True
-    except Exception as exc:
-        logger.error("Download failed %s -> %s: %s", url, dest, exc)
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Auto-update handler (with chattr +i handling and SHA256 verification)
-# ---------------------------------------------------------------------------
-
-
-def _set_immutable(path: str, immutable: bool) -> bool:
-    """
-    Set or clear the immutable (chattr +i/-i) flag on a file.
-    Returns True if the operation succeeded.
-    """
-    flag = "+i" if immutable else "-i"
-    try:
-        result = subprocess.run(
-            ["chattr", flag, path],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode != 0:
-            logger.warning("chattr %s %s failed: %s", flag, path,
-                           result.stderr.strip() if result.stderr else "unknown error")
-            return False
-
-        # Verify the flag was actually set/unset
-        verify_result = subprocess.run(
-            ["lsattr", path],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if verify_result.returncode == 0:
-            attrs = verify_result.stdout.strip()
-            is_immutable_now = "-i-" in attrs or "i" in attrs.split()[0] if attrs else False
-            if immutable and not is_immutable_now:
-                logger.warning("Verification failed: %s is NOT immutable after chattr +i", path)
-                return False
-            elif not immutable and is_immutable_now:
-                logger.warning("Verification failed: %s IS still immutable after chattr -i", path)
-                return False
-
-        logger.info("chattr %s %s succeeded", flag, path)
-        return True
-    except Exception as exc:
-        logger.error("chattr exception for %s: %s", path, exc)
-        return False
-
-
-def handle_update_all(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Download latest files from GitHub with SHA256 manifest verification.
-    Properly handles chattr +i by toggling the flag during updates.
-    Includes downgrade attack prevention.
-    """
-    logger.info("Action: update_all")
-
-    # Files that may be immutable (source scripts)
-    IMMUTABLE_FILES = {
-        os.path.join(APP_DIR, "src", "daemon.py"),
-        os.path.join(APP_DIR, "src", "gui.py"),
-    }
-
-    files = [
-        ("src/daemon.py", os.path.join(APP_DIR, "src", "daemon.py")),
-        ("src/gui.py", os.path.join(APP_DIR, "src", "gui.py")),
-        ("data.json", os.path.join(CONFIG_DIR, "data.json")),
-        ("version.json", os.path.join(CONFIG_DIR, "version.json")),
-    ]
-
-    # Step 1: Download and verify the update manifest
-    manifest_url = f"{RAW_BASE}/update_manifest.json"
-    manifest = None
-    manifest_hashes = {}
-
-    try:
-        req = urllib.request.Request(manifest_url)
-        req.add_header("User-Agent", "IT-Aman/3.0")
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            manifest_content = resp.read().decode("utf-8")
-        manifest = json.loads(manifest_content)
-
-        # Verify manifest Ed25519 signature
-        if not _verify_manifest_signature(manifest):
-            return {
-                "status": "error",
-                "message": "Update manifest signature verification failed — possible security breach. Rejecting update.",
-                "updated": [],
-                "failed": [f[0] for f in files],
-            }
-
-        # Extract hashes from manifest
-        manifest_hashes = manifest.get("files", {})
-        remote_version = manifest.get("version", "0.0")
-
-        # Downgrade attack prevention
-        local_version = _config.get("version", "0.0")
-        if remote_version and local_version:
-            parts_local = [int(x) for x in local_version.split(".")]
-            parts_remote = [int(x) for x in remote_version.split(".")]
-            max_len = max(len(parts_local), len(parts_remote))
-            parts_local += [0] * (max_len - len(parts_local))
-            parts_remote += [0] * (max_len - len(parts_remote))
-            if parts_remote <= parts_local:
-                logger.info("Remote version %s <= local %s -- no update needed",
-                            remote_version, local_version)
-                return {
-                    "status": "ok",
-                    "message": "Already up to date",
-                    "updated": [],
-                    "failed": [],
-                    "version": local_version,
-                }
-
-        logger.info("Manifest verified. Remote version: %s, hashes for %d files",
-                     remote_version, len(manifest_hashes))
-
-    except Exception as exc:
-        logger.warning("Could not download/verify manifest: %s -- proceeding without hash verification", exc)
-        # Continue without manifest verification (backward compatibility)
-
-    # Step 2: Download and update each file
-    updated: List[str] = []
-    failed: List[str] = []
-    immutable_restore: List[str] = []  # Files to re-lock after update
-
-    for src, dst in files:
-        url = f"{RAW_BASE}/{src}"
-        is_immutable = False  # Source files are not immutable — manifest verification protects them
-
-        # Lift immutable flag BEFORE attempting download
-        if is_immutable:
-            if not _set_immutable(dst, False):
-                logger.error("Cannot remove immutable flag from %s -- update blocked", dst)
-                failed.append(src)
-                continue
-            immutable_restore.append(dst)
-
-        try:
-            expected_hash = manifest_hashes.get(src, "")
-            success = False
-            for attempt in range(3):
-                if _download_file_verified(url, dst, timeout=30, expected_hash=expected_hash):
-                    success = True
-                    updated.append(src)
-                    break
-                if attempt < 2:
-                    time.sleep(1 * (attempt + 1))
-
-            if not success:
-                failed.append(src)
-                logger.error("Failed to download %s after 3 attempts", src)
-        except Exception as exc:
-            failed.append(src)
-            logger.error("Error updating %s: %s", src, exc)
-
-    # Step 3: Re-lock immutable files (even if some updates failed)
-    for path in immutable_restore:
-        if os.path.isfile(path):
-            _set_immutable(path, True)
-
-    # Step 4: Update version in config
-    if manifest and updated:
-        remote_version = manifest.get("version", "")
-        if remote_version:
-            _config["version"] = remote_version
-            _config["last_update_check"] = int(time.time())
-            _save_config(_config)
-            logger.info("Updated local version to %s", remote_version)
-
-    if not updated:
+    if brand not in ("xprinter", "sprt"):
         return {
             "status": "error",
-            "message": "No files updated -- check internet connection",
-            "updated": [],
-            "failed": failed,
+            "message": f"Unsupported brand '{brand}'. Use 'xprinter' or 'sprt'.",
         }
 
-    result_msg = f"Updated {len(updated)} file(s)"
-    if failed:
-        result_msg += f" (failed: {', '.join(failed)})"
-
-    return {
-        "status": "ok" if not failed else "partial",
-        "updated": updated,
-        "failed": failed,
-        "message": result_msg,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Network + USB Auto-Discovery Handler
-# ---------------------------------------------------------------------------
-
-
-def handle_discover_printers(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Discover all printers (USB + Network) via lpinfo -v."""
-    logger.info("Action: discover_printers")
-
-    steps: List[Dict[str, str]] = []
-
-    rc, stdout, stderr = run_command(["lpinfo", "-v"], timeout=15)
-    if rc != 0:
-        return {"status": "error", "message": f"lpinfo -v failed: {stderr}"}
-
-    usb_printers: List[Dict[str, Any]] = []
-    network_printers: List[Dict[str, Any]] = []
-
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split(None, 1)
-        if not parts or len(parts) < 2:
-            continue
-
-        uri = parts[-1].strip()
-
-        if uri.startswith("usb://"):
-            desc = uri.replace("usb://", "").rstrip("/")
-            usb_printers.append({"uri": uri, "description": desc, "type": "usb"})
-        elif uri.startswith(("ipp://", "ipps://", "http://", "https://", "socket://", "lpd://")):
-            host_match = re.search(r'://([^:/]+)', uri)
-            host = host_match.group(1) if host_match else ""
-            port_match = re.search(r':(\d+)', uri)
-            port = port_match.group(1) if port_match else ""
-            network_printers.append({
-                "uri": uri, "host": host, "port": port,
-                "description": host or uri, "type": "network",
-                "reachable": False, "latency_ms": None,
-            })
-
-    # Ping network printers concurrently
-    if network_printers:
-        def _ping_disc(entry: Dict[str, Any]) -> Dict[str, Any]:
-            host = entry["host"]
-            if host and sanitize_ip(host):
-                rc_ping, out_ping, _ = run_command(["ping", "-c", "1", "-W", "2", host])
-                entry["reachable"] = (rc_ping == 0)
-            return entry
-
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=min(len(network_printers), 20)) as pool:
-            network_printers = list(pool.map(_ping_disc, network_printers))
-
-    steps.append({"step": "Auto-discover Printers", "status": "success",
-                   "message": f"Found {len(usb_printers)} USB and {len(network_printers)} network printers"})
-
-    return {
-        "status": "ok",
-        "usb_printers": usb_printers,
-        "network_printers": network_printers,
-        "steps": steps,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Load data.json handler (for GUI to reload data)
-# ---------------------------------------------------------------------------
-
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper: paper feed + duplex defaults for network printer (Printers-Tools)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _set_network_printer_defaults(printer_name: str) -> None:
-    """Apply InputSlot=One and Duplex=None defaults after lpadmin."""
-    rc, out, _ = run_command(["lpoptions", "-p", printer_name, "-l"], timeout=5)
-    if rc != 0:
-        return
-    paperfeed_key = ""
-    for line in out.splitlines():
-        key = line.split("/")[0].split(":")[0].strip()
-        if re.match(r"^(InputSlot|MediaSource|PaperFeed|KCFeeder)$", key, re.IGNORECASE):
-            paperfeed_key = key
-            break
-    if paperfeed_key:
-        # Find value One/Cassette1/Tray1/Upper
-        val_match = re.search(r"\b(One|Cassette1|Tray1|Upper)\b", out, re.IGNORECASE)
-        val = val_match.group(1) if val_match else "One"
-        run_command(["lpoptions", "-p", printer_name, "-o",
-                     f"{paperfeed_key}={val}", "-o", "Duplex=None"], timeout=5)
-        run_command(["lpadmin", "-p", printer_name,
-                     "-o", f"{paperfeed_key}={val}", "-o", "Duplex=None"], timeout=5)
+    if brand == "xprinter":
+        return _install_xprinter()
     else:
-        run_command(["lpoptions", "-p", printer_name, "-o", "Duplex=None"], timeout=5)
+        return _install_sprt()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper: ensure Kyocera deb is installed (download from Dropbox if needed)
-# ─────────────────────────────────────────────────────────────────────────────
+def _install_xprinter() -> dict:
+    """Install XPrinter XP-80 driver and set up the printer."""
+    report = {"status": "ok", "actions": [], "brand": "xprinter"}
 
-def _ensure_kyocera_driver_installed(current_lpinfo_output: str = "") -> bool:
-    """
-    Check if a Kyocera CUPS driver is already available.
-    If not, download and install kyodialog deb from Dropbox.
-    Returns True if driver is available after attempt.
-    """
-    # Already available?
-    if re.search(r"M3550idn|ECOSYS", current_lpinfo_output, re.IGNORECASE):
-        return True
+    # Remove existing printer first
+    if is_printer_exists(XPRINTER_PRINTER_NAME):
+        run_cmd(["lpadmin", "-x", XPRINTER_PRINTER_NAME])
+        report["actions"].append(f"Removed existing printer '{XPRINTER_PRINTER_NAME}'")
 
-    rc, out, _ = run_command(["lpinfo", "-m"], timeout=10)
-    if rc == 0 and re.search(r"M3550idn|ECOSYS|Kyocera", out, re.IGNORECASE):
-        return True
-
-    logger.info("Kyocera driver not found — attempting auto-download from Dropbox")
-    import urllib.request
+    tmp_dir = tempfile.mkdtemp(prefix="xprinter_")
     try:
-        req = urllib.request.Request(
-            KYOCERA_DEB_URL, headers={"User-Agent": "Mozilla/5.0"}
-        )
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            with open(KYOCERA_DEB_PATH, "wb") as f:
-                f.write(resp.read())
+        # Download the installer binary
+        installer_path = os.path.join(tmp_dir, "install-xp80")
+        if not download_file(XPRINTER_DRIVER_URL, installer_path, "XPrinter XP-80 installer"):
+            return {"status": "error", "message": "Failed to download XPrinter driver"}
+
+        # Make executable and run
+        os.chmod(installer_path, 0o755)
+        rc, out, err = run_cmd(["bash", installer_path], timeout=120)
+        if rc != 0:
+            report["actions"].append(f"Installer returned code {rc}: {err}")
+            log.warning("XPrinter installer exit code %d: %s", rc, err)
+        else:
+            report["actions"].append("XPrinter installer ran successfully")
+
+        # Restart CUPS to pick up new PPDs/filters
+        cups_restart()
+
+        # Find USB URIs
+        usb_uris = get_usb_uris()
+        if not usb_uris:
+            report["actions"].append("No USB printer found — will retry on plug-in")
+            usb_uri = "usb://XPrinter/XP-80"  # Placeholder
+        else:
+            # Pick the first USB URI (most likely the XP-80)
+            usb_uri = usb_uris[0]
+            report["actions"].append(f"Found USB URI: {usb_uri}")
+
+        # Find PPD via lpinfo
+        ppd = find_ppd_for_model("XP-80")
+        if not ppd:
+            # Broader search
+            drivers = get_cups_ppd_drivers()
+            for drv in drivers:
+                if "xp-80" in drv["description"].lower() or "xprinter" in drv["description"].lower():
+                    ppd = drv["ppd"]
+                    break
+
+        if ppd:
+            rc, _, err = run_cmd(
+                ["lpadmin", "-p", XPRINTER_PRINTER_NAME, "-E", "-v", usb_uri, "-m", ppd],
+                timeout=30,
+            )
+            if rc == 0:
+                report["actions"].append(f"Printer added with PPD: {ppd}")
+            else:
+                report["actions"].append(f"lpadmin with PPD failed: {err}")
+        else:
+            # Try with -m everywhere as fallback
+            rc, _, err = run_cmd(
+                ["lpadmin", "-p", XPRINTER_PRINTER_NAME, "-E", "-v", usb_uri, "-m", "everywhere"],
+                timeout=30,
+            )
+            if rc == 0:
+                report["actions"].append("Printer added with IPP Everywhere driver")
+            else:
+                report["actions"].append(f"IPP Everywhere also failed: {err}")
+
+        # Enable, accept, set defaults
+        run_cmd(["cupsenable", XPRINTER_PRINTER_NAME])
+        run_cmd(["cupsaccept", XPRINTER_PRINTER_NAME])
+        _set_thermal_cut_defaults(XPRINTER_PRINTER_NAME)
+
+        report["actions"].append("XPrinter XP-80 setup complete")
+        return report
+
     except Exception as exc:
-        logger.error("Kyocera deb download failed: %s", exc)
-        return False
+        log.error("XPrinter install error: %s", exc)
+        return {"status": "error", "message": str(exc)}
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    if not os.path.getsize(KYOCERA_DEB_PATH):
-        return False
 
-    env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
-    run_command(["dpkg", "-i", KYOCERA_DEB_PATH], timeout=120, env=env)
-    run_command(["apt-get", "install", "-f", "-y"], timeout=120, env=env)
-    run_command(["systemctl", "restart", "cups"], timeout=15)
+def _install_sprt() -> dict:
+    """Install SPRT thermal printer driver and set up the printer."""
+    report = {"status": "ok", "actions": [], "brand": "sprt"}
 
+    # Remove existing printer first
+    if is_printer_exists(SPRT_PRINTER_NAME):
+        run_cmd(["lpadmin", "-x", SPRT_PRINTER_NAME])
+        report["actions"].append(f"Removed existing printer '{SPRT_PRINTER_NAME}'")
+
+    tmp_dir = tempfile.mkdtemp(prefix="sprt_")
     try:
-        os.unlink(KYOCERA_DEB_PATH)
-    except OSError:
-        pass
+        # Download the driver zip
+        zip_path = os.path.join(tmp_dir, "sprt_driver.zip")
+        if not download_file(SPRT_DRIVER_URL, zip_path, "SPRT driver zip"):
+            return {"status": "error", "message": "Failed to download SPRT driver"}
 
-    import time as _time; _time.sleep(3)
+        # Extract
+        extract_dir = os.path.join(tmp_dir, "sprt_extracted")
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(extract_dir)
+            report["actions"].append("Extracted SPRT driver archive")
+        except zipfile.BadZipFile:
+            # The Dropbox download might not be a zip — try running it directly
+            os.chmod(zip_path, 0o755)
+            rc, out, err = run_cmd(["bash", zip_path], timeout=120)
+            report["actions"].append(f"Ran downloaded file directly: rc={rc}")
+            extract_dir = tmp_dir
 
-    rc2, out2, _ = run_command(["lpinfo", "-m"], timeout=10)
-    return rc2 == 0 and bool(re.search(r"M3550idn|ECOSYS|Kyocera", out2, re.IGNORECASE))
+        # Find and run install.sh
+        install_sh = None
+        for root, dirs, files in os.walk(extract_dir):
+            for f in files:
+                if f.lower() == "install.sh":
+                    install_sh = os.path.join(root, f)
+                    break
+            if install_sh:
+                break
+
+        if install_sh:
+            os.chmod(install_sh, 0o755)
+            rc, out, err = run_cmd(["bash", install_sh], timeout=120)
+            if rc == 0:
+                report["actions"].append("install.sh ran successfully")
+            else:
+                report["actions"].append(f"install.sh returned {rc}: {err}")
+                log.warning("install.sh exit code %d: %s", rc, err)
+        else:
+            report["actions"].append("No install.sh found — continuing manually")
+            log.warning("No install.sh found in SPRT driver archive")
+
+        # Copy rastertoprinter filter if present
+        for root, dirs, files in os.walk(extract_dir):
+            for f in files:
+                if "rastertoprinter" in f.lower():
+                    src = os.path.join(root, f)
+                    dst = "/usr/lib/cups/filter/rastertoprinter"
+                    try:
+                        shutil.copy2(src, dst)
+                        os.chmod(dst, 0o755)
+                        report["actions"].append(f"Copied filter: {src} -> {dst}")
+                    except Exception as exc:
+                        report["actions"].append(f"Failed to copy filter: {exc}")
+                    break
+
+        # Find the PPD file
+        ppd_src = None
+        for root, dirs, files in os.walk(extract_dir):
+            for f in files:
+                if f.endswith(".ppd") and "80mm" in f.lower():
+                    ppd_src = os.path.join(root, f)
+                    break
+            if ppd_src:
+                break
+
+        # If not found in archive, check if install.sh placed it
+        if not ppd_src and os.path.isfile(SPRT_PPD_DEST):
+            ppd_src = SPRT_PPD_DEST
+
+        # If still not found, do a broader search
+        if not ppd_src:
+            for root, dirs, files in os.walk(extract_dir):
+                for f in files:
+                    if f.endswith(".ppd"):
+                        ppd_src = os.path.join(root, f)
+                        break
+                if ppd_src:
+                    break
+
+        if ppd_src:
+            # Copy PPD to CUPS model directory
+            ppd_dir = os.path.dirname(SPRT_PPD_DEST)
+            os.makedirs(ppd_dir, exist_ok=True)
+            try:
+                shutil.copy2(ppd_src, SPRT_PPD_DEST)
+                report["actions"].append(f"Installed PPD: {SPRT_PPD_DEST}")
+            except Exception as exc:
+                report["actions"].append(f"Failed to copy PPD: {exc}")
+
+            # Patch FullCut default to PartialCut in PPD
+            try:
+                with open(SPRT_PPD_DEST, "r") as fh:
+                    ppd_content = fh.read()
+                # Replace FullCut default with PartialCut
+                patched = ppd_content.replace(
+                    "*DefaultFullCut: True",
+                    "*DefaultFullCut: False"
+                )
+                patched = patched.replace(
+                    "*DefaultFullCut: full",
+                    "*DefaultFullCut: partial"
+                )
+                # Also patch DocumentCut if present
+                patched = patched.replace(
+                    "*DefaultDocumentCut: True",
+                    "*DefaultDocumentCut: False"
+                )
+                if patched != ppd_content:
+                    with open(SPRT_PPD_DEST, "w") as fh:
+                        fh.write(patched)
+                    report["actions"].append("Patched PPD: FullCut -> PartialCut default")
+            except Exception as exc:
+                report["actions"].append(f"PPD patch failed (non-fatal): {exc}")
+
+        # Restart CUPS to pick up new PPDs/filters
+        cups_restart()
+
+        # Find USB URI
+        usb_uris = get_usb_uris()
+        if not usb_uris:
+            report["actions"].append("No USB printer found — will retry on plug-in")
+            usb_uri = "usb://SPRT/Printer"
+        else:
+            usb_uri = usb_uris[0]
+            report["actions"].append(f"Found USB URI: {usb_uri}")
+
+        # Set up printer with -P flag (direct PPD path)
+        if os.path.isfile(SPRT_PPD_DEST):
+            rc, _, err = run_cmd(
+                [
+                    "lpadmin", "-p", SPRT_PRINTER_NAME, "-E",
+                    "-v", usb_uri,
+                    "-P", SPRT_PPD_DEST,
+                ],
+                timeout=30,
+            )
+            if rc == 0:
+                report["actions"].append(f"Printer added with PPD: {SPRT_PPD_DEST}")
+            else:
+                report["actions"].append(f"lpadmin -P failed: {err}")
+        else:
+            # Fallback: try -m everywhere
+            rc, _, err = run_cmd(
+                [
+                    "lpadmin", "-p", SPRT_PRINTER_NAME, "-E",
+                    "-v", usb_uri, "-m", "everywhere",
+                ],
+                timeout=30,
+            )
+            if rc == 0:
+                report["actions"].append("Printer added with IPP Everywhere (fallback)")
+            else:
+                report["actions"].append(f"All setup methods failed: {err}")
+
+        # Enable, accept, set thermal defaults
+        run_cmd(["cupsenable", SPRT_PRINTER_NAME])
+        run_cmd(["cupsaccept", SPRT_PRINTER_NAME])
+        _set_thermal_cut_defaults(SPRT_PRINTER_NAME)
+
+        report["actions"].append("SPRT printer setup complete")
+        return report
+
+    except Exception as exc:
+        log.error("SPRT install error: %s", exc)
+        return {"status": "error", "message": str(exc)}
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Remove Printer
-# ─────────────────────────────────────────────────────────────────────────────
+# ---- handle_remove_printer ------------------------------------------------
 
-def handle_remove_printer(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Remove a CUPS printer: cancel jobs → disable → lpadmin -x."""
-    name = (data.get("name") or "").strip()
+def handle_remove_printer(params: dict) -> dict:
+    """
+    Remove a printer from CUPS:
+      1. Cancel all its jobs
+      2. Disable it
+      3. Delete it with lpadmin -x
+    """
+    name = params.get("name", "").strip()
     if not name:
         return {"status": "error", "message": "Printer name is required"}
 
-    logger.info("Action: remove_printer -- name=%s", name)
-    steps: List[Dict[str, str]] = []
+    actions = []
 
     # Cancel all jobs
-    run_command(["cancel", "-a", name], timeout=10)
-    steps.append({"step": "Cancel Jobs", "status": "success",
-                   "message": f"Cleared print queue for {name}"})
-
-    # Disable
-    run_command(["cupsdisable", name], timeout=5)
-    steps.append({"step": "Disable Printer", "status": "success", "message": f"Disabled {name}"})
-
-    # Remove
-    import time as _t; _t.sleep(1)
-    rc, _, err = run_command(["lpadmin", "-x", name], timeout=10)
+    rc, _, err = run_cmd(["cancel", "-a", name])
     if rc == 0:
-        steps.append({"step": "Remove Printer", "status": "success",
-                       "message": f"Printer '{name}' removed"})
-        return {"status": "ok", "steps": steps, "message": f"Printer '{name}' removed successfully"}
+        actions.append(f"Cancelled all jobs on '{name}'")
     else:
-        steps.append({"step": "Remove Printer", "status": "failed",
-                       "message": err or f"lpadmin -x {name} failed"})
-        return {"status": "error", "steps": steps, "message": f"Failed to remove {name}"}
+        actions.append(f"No jobs to cancel (or cancel failed): {err}")
+
+    # Disable printer
+    rc, _, err = run_cmd(["cupsdisable", name])
+    if rc == 0:
+        actions.append(f"Disabled printer '{name}'")
+    else:
+        actions.append(f"Disable failed (non-fatal): {err}")
+
+    # Remove printer
+    rc, _, err = run_cmd(["lpadmin", "-x", name])
+    if rc == 0:
+        actions.append(f"Removed printer '{name}' successfully")
+        log.info("Printer '%s' removed", name)
+    else:
+        return {"status": "error", "message": f"Failed to remove printer: {err}", "actions": actions}
+
+    return {"status": "ok", "actions": actions}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Quick Fix Spooler — stop CUPS, clear spool, restart
-# ─────────────────────────────────────────────────────────────────────────────
+# ---- handle_quick_fix_spooler ---------------------------------------------
 
-def handle_quick_fix_spooler(_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Stop CUPS, wipe /var/spool/cups/*, restart CUPS."""
-    import shutil as _shutil
-    logger.info("Action: quick_fix_spooler")
-    steps: List[Dict[str, str]] = []
+def handle_quick_fix_spooler(params: dict) -> dict:
+    """
+    Quick fix for a stuck spooler:
+      1. Stop CUPS
+      2. Clear /var/spool/cups/*
+      3. Start CUPS
+    """
+    actions = []
 
-    run_command(["systemctl", "stop", "cups"], timeout=15)
-    steps.append({"step": "Stop CUPS", "status": "success", "message": "CUPS stopped"})
+    # Stop CUPS
+    if cups_stop():
+        actions.append("CUPS stopped")
+    else:
+        return {"status": "error", "message": "Failed to stop CUPS", "actions": actions}
 
-    spool = "/var/spool/cups"
+    # Clear spool directory
+    spool_dir = "/var/spool/cups"
     try:
-        for item in os.listdir(spool):
-            p = os.path.join(spool, item)
-            if os.path.isfile(p):
-                os.unlink(p)
-            elif os.path.isdir(p) and item not in ("tmp",):
-                _shutil.rmtree(p, ignore_errors=True)
-        steps.append({"step": "Clear Spool", "status": "success", "message": "Print queue wiped"})
+        for entry in os.listdir(spool_dir):
+            path = os.path.join(spool_dir, entry)
+            try:
+                if os.path.isfile(path) or os.path.islink(path):
+                    os.remove(path)
+                elif os.path.isdir(path):
+                    shutil.rmtree(path)
+            except Exception as exc:
+                log.warning("Could not remove %s: %s", path, exc)
+        actions.append(f"Cleared spool directory: {spool_dir}")
+    except FileNotFoundError:
+        actions.append(f"Spool directory {spool_dir} does not exist (ok)")
     except Exception as exc:
-        steps.append({"step": "Clear Spool", "status": "failed", "message": str(exc)})
+        actions.append(f"Error clearing spool: {exc}")
 
-    run_command(["systemctl", "start", "cups"], timeout=15)
-    steps.append({"step": "Start CUPS", "status": "success", "message": "CUPS restarted"})
+    # Start CUPS
+    if cups_start():
+        actions.append("CUPS started")
+    else:
+        return {"status": "error", "message": "Failed to start CUPS after clearing spool", "actions": actions}
 
-    return {"status": "ok", "steps": steps, "message": "Print spooler reset successfully"}
+    log.info("Quick fix spooler complete")
+    return {"status": "ok", "actions": actions}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Active Network Scan — full port scan + mDNS + HTTP model probe
-# ─────────────────────────────────────────────────────────────────────────────
+# ---- handle_detect_usb_printers -------------------------------------------
 
-def _tcp_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
-    import socket
+def handle_detect_usb_printers(params: dict) -> dict:
+    """
+    Detect USB printers connected to the system.
+    Uses lpinfo -v for URIs and lsusb for descriptions.
+    Returns list of {uri, description, type}.
+    """
+    printers = []
+
+    # Get USB URIs from lpinfo
+    backends = get_cups_backends()
+    usb_entries = [b for b in backends if b.startswith("usb://")]
+
+    # Get lsusb output for descriptions
+    rc, lsusb_out, _ = run_cmd(["lsusb"])
+    lsusb_lines = lsusb_out.splitlines() if rc == 0 and lsusb_out else []
+
+    for entry in usb_entries:
+        # Parse USB URI: usb://Vendor/Model?serial=XXX
+        uri = entry.split(":", 1)[1].strip() if ":" in entry else entry
+
+        # Try to match with lsusb description
+        description = "USB Printer"
+        # Extract vendor from URI
+        uri_lower = uri.lower()
+        for line in lsusb_lines:
+            line_lower = line.lower()
+            # Check if any part of the URI appears in lsusb line
+            # USB URIs often have the vendor name
+            vendor_match = re.search(r'usb://([^/?]+)', uri)
+            if vendor_match:
+                vendor = vendor_match.group(1).lower()
+                if vendor in line_lower:
+                    description = line.strip()
+                    break
+
+        printers.append({
+            "uri": uri,
+            "full_uri": entry,
+            "description": description,
+            "type": "usb",
+        })
+
+    log.info("Detected %d USB printers", len(printers))
+    return {"status": "ok", "printers": printers}
+
+
+# ---- handle_discover_printers (combo of USB + network) --------------------
+
+def handle_discover_printers(params: dict) -> dict:
+    """
+    Discover all printers: USB + network via CUPS backends and mDNS.
+    Combines detect_usb_printers and scan for a full picture.
+    """
+    usb_result = handle_detect_usb_printers(params)
+    scan_result = handle_scan(params)
+
+    printers = []
+
+    # Add USB printers
+    if usb_result.get("status") == "ok":
+        printers.extend(usb_result.get("printers", []))
+
+    # Add network printers (avoiding duplicates)
+    seen_uris = {p.get("uri") for p in printers}
+    if scan_result.get("status") == "ok":
+        for p in scan_result.get("printers", []):
+            if p.get("uri") not in seen_uris:
+                printers.append(p)
+                seen_uris.add(p.get("uri"))
+
+    return {"status": "ok", "printers": printers}
+
+
+# ---- handle_clear_jobs ----------------------------------------------------
+
+def handle_clear_jobs(params: dict) -> dict:
+    """
+    Clear print jobs for a specific printer or all printers.
+    Params: name (optional) — if omitted, clears all jobs.
+    """
+    name = params.get("name", "").strip()
+
+    if name:
+        rc, out, err = run_cmd(["cancel", "-a", name])
+        if rc == 0:
+            log.info("Cleared all jobs on '%s'", name)
+            return {"status": "ok", "message": f"All jobs cleared on '{name}'"}
+        else:
+            return {"status": "error", "message": f"Failed to clear jobs: {err}"}
+    else:
+        rc, out, err = run_cmd(["cancel", "-a"])
+        if rc == 0:
+            log.info("Cleared all print jobs")
+            return {"status": "ok", "message": "All print jobs cleared"}
+        else:
+            return {"status": "error", "message": f"Failed to clear all jobs: {err}"}
+
+
+# ---- handle_test_print ----------------------------------------------------
+
+def handle_test_print(params: dict) -> dict:
+    """
+    Send a test page to the specified printer.
+    Uses CUPS test page via lp command.
+    """
+    name = params.get("name", "").strip()
+
+    if not name:
+        return {"status": "error", "message": "Printer name is required"}
+
+    # Check printer exists
+    if not is_printer_exists(name):
+        return {"status": "error", "message": f"Printer '{name}' does not exist"}
+
+    # Try to print the CUPS test page
+    test_page = "/usr/share/cups/data/testprint"
+    if not os.path.isfile(test_page):
+        # Generate a simple test page
+        tmp_dir = tempfile.mkdtemp(prefix="testprint_")
+        test_page = os.path.join(tmp_dir, "test.txt")
+        with open(test_page, "w") as fh:
+            fh.write("=" * 60 + "\n")
+            fh.write("  IT Aman Printer Daemon — Test Page\n")
+            fh.write(f"  Printer: {name}\n")
+            fh.write(f"  Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            fh.write(f"  Version: {VERSION}\n")
+            fh.write("=" * 60 + "\n")
+
+    rc, out, err = run_cmd(
+        ["lp", "-d", name, "-o", "fit-to-page", test_page],
+        timeout=30,
+    )
+
+    if rc == 0:
+        # Extract job ID from output
+        job_id = out.strip() if out else "unknown"
+        log.info("Test print sent to '%s': %s", name, job_id)
+        return {"status": "ok", "message": f"Test page sent to '{name}'", "job_id": job_id}
+    else:
+        return {"status": "error", "message": f"Test print failed: {err}"}
+
+
+# ---- handle_update_all (self-update from public GitHub) -------------------
+
+def handle_update_all(params: dict) -> dict:
+    """
+    Check for and apply updates from the public GitHub repository.
+    NO token needed — repo is public, uses raw.githubusercontent.com URLs.
+
+    Process:
+      1. Download version.json from raw.githubusercontent.com
+      2. Compare versions
+      3. Download update_manifest.json, verify Ed25519 signature
+      4. Download new files, replace, restart daemon
+    """
+    report = {"status": "ok", "actions": []}
+
+    # --- Step 1: Fetch remote version ---
+    version_url = f"{RAW_BASE}/version.json"
+    log.info("Checking for updates at %s", version_url)
+    version_text = download_text(version_url)
+    if not version_text:
+        return {"status": "error", "message": "Failed to fetch version.json from GitHub"}
+
     try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except Exception:
+        remote_info = json.loads(version_text)
+    except json.JSONDecodeError as exc:
+        return {"status": "error", "message": f"Invalid version.json: {exc}"}
+
+    remote_version = remote_info.get("version", "")
+    if not remote_version:
+        return {"status": "error", "message": "version.json missing 'version' field"}
+
+    report["actions"].append(f"Remote version: {remote_version}, Local version: {VERSION}")
+
+    # Compare versions
+    if _compare_versions(remote_version, VERSION) <= 0:
+        report["actions"].append("Already up to date")
+        return report
+
+    log.info("Update available: %s -> %s", VERSION, remote_version)
+
+    # --- Step 2: Fetch update manifest ---
+    manifest_url = f"{RAW_BASE}/update_manifest.json"
+    manifest_text = download_text(manifest_url)
+    if not manifest_text:
+        return {"status": "error", "message": "Failed to fetch update_manifest.json"}
+
+    try:
+        manifest = json.loads(manifest_text)
+    except json.JSONDecodeError as exc:
+        return {"status": "error", "message": f"Invalid update_manifest.json: {exc}"}
+
+    # --- Step 3: Verify Ed25519 signature ---
+    signature_b64 = manifest.get("signature", "")
+    public_key_b64 = manifest.get("public_key", "")
+    files_list = manifest.get("files", [])
+
+    if not signature_b64 or not public_key_b64:
+        return {"status": "error", "message": "Update manifest missing signature or public_key"}
+
+    if not files_list:
+        return {"status": "error", "message": "Update manifest has no files to update"}
+
+    # Verify signature
+    try:
+        sig_valid = _verify_ed25519_signature(
+            public_key_b64, signature_b64, files_list
+        )
+        if not sig_valid:
+            return {"status": "error", "message": "Ed25519 signature verification FAILED — update rejected"}
+        report["actions"].append("Ed25519 signature verified")
+    except Exception as exc:
+        return {"status": "error", "message": f"Signature verification error: {exc}"}
+
+    # --- Step 4: Download and replace files ---
+    install_dir = os.path.dirname(os.path.abspath(__file__))
+    backup_dir = install_dir + ".backup"
+
+    # Create backup of current files
+    try:
+        if os.path.exists(backup_dir):
+            shutil.rmtree(backup_dir)
+        shutil.copytree(install_dir, backup_dir)
+        report["actions"].append(f"Backed up current files to {backup_dir}")
+    except Exception as exc:
+        return {"status": "error", "message": f"Failed to create backup: {exc}"}
+
+    # Download each file
+    updated_files = []
+    for file_info in files_list:
+        remote_path = file_info.get("path", "")
+        expected_sha256 = file_info.get("sha256", "")
+        if not remote_path:
+            continue
+
+        # Only update files within our src directory (security: no path traversal)
+        basename = os.path.basename(remote_path)
+        dest_path = os.path.join(install_dir, basename)
+        download_url = f"{RAW_BASE}/{remote_path}"
+
+        log.info("Downloading update: %s -> %s", download_url, dest_path)
+
+        tmp_dest = dest_path + ".new"
+        if not download_file(download_url, tmp_dest, basename):
+            report["actions"].append(f"Failed to download {basename}")
+            continue
+
+        # Verify SHA256 if provided
+        if expected_sha256:
+            actual_sha256 = _sha256_file(tmp_dest)
+            if actual_sha256 != expected_sha256:
+                log.error(
+                    "SHA256 mismatch for %s: expected %s, got %s",
+                    basename, expected_sha256, actual_sha256,
+                )
+                os.remove(tmp_dest)
+                report["actions"].append(f"SHA256 mismatch for {basename} — skipped")
+                continue
+
+        # Replace the file
+        try:
+            os.replace(tmp_dest, dest_path)
+            updated_files.append(basename)
+            report["actions"].append(f"Updated: {basename}")
+        except Exception as exc:
+            log.error("Failed to replace %s: %s", basename, exc)
+            report["actions"].append(f"Failed to replace {basename}: {exc}")
+            if os.path.isfile(tmp_dest):
+                os.remove(tmp_dest)
+
+    if not updated_files:
+        # Restore backup since nothing was updated
+        try:
+            shutil.rmtree(install_dir)
+            shutil.copytree(backup_dir, install_dir)
+        except Exception:
+            pass
+        return {"status": "error", "message": "No files were successfully updated", "actions": report["actions"]}
+
+    # --- Step 5: Update config with new version ---
+    cfg = load_config()
+    cfg["version"] = remote_version
+    save_config(cfg)
+
+    # --- Step 6: Restart daemon ---
+    report["actions"].append(f"Updated {len(updated_files)} file(s)")
+    report["actions"].append("Daemon will restart to apply updates")
+    report["new_version"] = remote_version
+
+    # Schedule restart in a separate thread so we can send the response first
+    def _restart_daemon():
+        time.sleep(2)
+        log.info("Restarting daemon after update...")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    threading.Thread(target=_restart_daemon, daemon=True).start()
+
+    return report
+
+
+def _compare_versions(v1: str, v2: str) -> int:
+    """
+    Compare two version strings.
+    Returns: 1 if v1 > v2, 0 if equal, -1 if v1 < v2.
+    """
+    def _parse(v):
+        parts = []
+        for p in v.split("."):
+            try:
+                parts.append(int(p))
+            except ValueError:
+                parts.append(0)
+        return parts
+
+    p1 = _parse(v1)
+    p2 = _parse(v2)
+    # Pad to same length
+    maxlen = max(len(p1), len(p2))
+    p1.extend([0] * (maxlen - len(p1)))
+    p2.extend([0] * (maxlen - len(p2)))
+
+    for a, b in zip(p1, p2):
+        if a > b:
+            return 1
+        elif a < b:
+            return -1
+    return 0
+
+
+def _sha256_file(path: str) -> str:
+    """Compute SHA-256 hex digest of a file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _verify_ed25519_signature(public_key_b64: str, signature_b64: str, files_list: list) -> bool:
+    """
+    Verify the Ed25519 signature of the update manifest's file list.
+    Uses the PyNaCl library (nacl) if available, otherwise falls back
+    to a manual verification attempt.
+    """
+    try:
+        import nacl.signing
+        import nacl.encoding
+    except ImportError:
+        log.warning(
+            "PyNaCl not installed — attempting Ed25519 verification with openssl"
+        )
+        return _verify_ed25519_openssl(public_key_b64, signature_b64, files_list)
+
+    try:
+        # Decode the public key
+        public_key_bytes = __import__("base64").b64decode(public_key_b64)
+        verify_key = nacl.signing.VerifyKey(public_key_bytes)
+
+        # The signed data is the canonical JSON of the files list
+        data = json.dumps(files_list, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+        # Decode and verify signature
+        sig_bytes = __import__("base64").b64decode(signature_b64)
+        verify_key.verify(data, sig_bytes)
+        log.info("Ed25519 signature verified (PyNaCl)")
+        return True
+    except Exception as exc:
+        log.error("Ed25519 verification failed (PyNaCl): %s", exc)
         return False
 
 
-def _probe_printer_model(ip: str) -> str:
-    """HTTP + ipptool probe to identify printer model."""
-    import urllib.request, html as _html
-    pages = ["/", "/general/information.html", "/info/overview.html",
-             "/status.cgi", "/cgi-bin/dynamic/config/status.html",
-             "/web/guest/en/websys/webArch/mainFrame.cgi"]
-    for path in pages:
-        try:
-            req = urllib.request.Request(
-                f"http://{ip}{path}", headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                body = resp.read(8192).decode("utf-8", errors="replace")
-                m = re.search(r"[Mm]odel\s*[:\-]?\s*([A-Za-z0-9][A-Za-z0-9\- ]{2,40})", body)
-                if m:
-                    return _html.unescape(m.group(1)).strip()
-                t = re.search(r"<title>([^<]{3,60})</title>", body, re.IGNORECASE)
-                if t:
-                    title = _html.unescape(t.group(1)).strip()
-                    if title.lower() not in {"home","login","welcome","index","web","page"}:
-                        return title
-        except Exception:
-            continue
-    # ipptool fallback
-    rc, out, _ = run_command(
-        ["ipptool", "-t", f"ipp://{ip}/ipp/print",
-         "/usr/share/cups/ipptool/get-printer-attributes.test"], timeout=5)
-    if rc == 0:
-        m = re.search(r"printer-make-and-model\s*=\s*\"?([^\"\n]+)\"?", out)
-        if m:
-            val = m.group(1).strip()
-            val = re.sub(r"(KYOCERA Document Solutions Inc\.?|Corporation|Inc\.?)", "", val, flags=re.IGNORECASE)
-            return val.strip()
-    return ""
-
-
-def handle_network_scan(_data: Dict[str, Any]) -> Dict[str, Any]:
+def _verify_ed25519_openssl(public_key_b64: str, signature_b64: str, files_list: list) -> bool:
     """
-    Full active network scan (ported from Printers-Tools v1.3):
-      1. CUPS lpinfo -v (existing backends)
-      2. TCP port scan on 631 + 9100 across /24 subnet
-      3. mDNS via avahi-browse _ipp._tcp
-      4. HTTP + ipptool model probe per discovered IP
+    Fallback: verify Ed25519 signature using the openssl CLI.
     """
-    logger.info("Action: network_scan")
-    found: dict = {}
+    import base64
 
-    # 1. lpinfo -v
-    rc, out, _ = run_command(["lpinfo", "-v"], timeout=15)
-    if rc == 0:
-        for line in out.splitlines():
-            parts = line.strip().split(None, 1)
-            uri = parts[-1].strip() if len(parts) == 2 else ""
-            if re.match(r"^(ipp|ipps|lpd|socket)://", uri, re.IGNORECASE):
-                ip_m = re.search(r"://([0-9]{1,3}(?:\.[0-9]{1,3}){3})", uri)
-                if ip_m:
-                    ip = ip_m.group(1)
-                    if ip not in found:
-                        found[ip] = {"ip": ip, "uri": uri, "model": "", "source": "lpinfo"}
-
-    # 2. Local subnet TCP scan
-    local_ip = ""
+    tmp_dir = tempfile.mkdtemp(prefix="ed25519_")
     try:
-        import socket as _sock
-        s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-    except Exception:
-        pass
+        # Write public key in DER format, then convert to PEM
+        pub_der = os.path.join(tmp_dir, "pub.der")
+        pub_pem = os.path.join(tmp_dir, "pub.pem")
+        sig_file = os.path.join(tmp_dir, "sig.bin")
+        data_file = os.path.join(tmp_dir, "data.bin")
 
-    if local_ip:
-        subnet = ".".join(local_ip.split(".")[:3])
-        hosts = [f"{subnet}.{i}" for i in range(1, 255)]
+        with open(pub_der, "wb") as fh:
+            fh.write(base64.b64decode(public_key_b64))
+        with open(sig_file, "wb") as fh:
+            fh.write(base64.b64decode(signature_b64))
+        with open(data_file, "wb") as fh:
+            fh.write(json.dumps(files_list, sort_keys=True, separators=(",", ":")).encode("utf-8"))
 
-        def _scan(h: str) -> Optional[str]:
-            return h if (_tcp_port_open(h, 631, 1.0) or _tcp_port_open(h, 9100, 1.0)) else None
+        # Convert DER public key to PEM
+        rc, _, err = run_cmd([
+            "openssl", "pkey", "-pubin", "-inform", "DER",
+            "-in", pub_der, "-outform", "PEM", "-out", pub_pem,
+        ])
+        if rc != 0:
+            # Try as raw Ed25519 key (32 bytes)
+            # Need to wrap in ASN.1 structure
+            raw_key = base64.b64decode(public_key_b64)
+            if len(raw_key) == 32:
+                # Create a minimal Ed25519 public key PEM
+                # OpenSSL Ed25519 public key DER: 30 2a 30 05 06 03 2b 65 70 03 21 00 <32 bytes>
+                der_prefix = bytes.fromhex("302a300506032b6570032100")
+                full_der = der_prefix + raw_key
+                b64_der = base64.b64encode(full_der).decode()
+                pem_content = (
+                    "-----BEGIN PUBLIC KEY-----\n"
+                    + "\n".join(b64_der[i:i+64] for i in range(0, len(b64_der), 64))
+                    + "\n-----END PUBLIC KEY-----\n"
+                )
+                with open(pub_pem, "w") as fh:
+                    fh.write(pem_content)
+            else:
+                log.error("Cannot create Ed25519 PEM from key of length %d", len(raw_key))
+                return False
 
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=64) as pool:
-            for h in pool.map(_scan, hosts):
-                if h and h not in found:
-                    found[h] = {"ip": h, "uri": f"ipp://{h}/ipp/print",
-                                "model": "", "source": "tcp_scan"}
+        # Verify
+        rc, out, err = run_cmd([
+            "openssl", "dgst", "-sha512", "-verify", pub_pem,
+            "-signature", sig_file, data_file,
+        ])
+        if rc == 0 and "Verified OK" in (out or ""):
+            log.info("Ed25519 signature verified (openssl)")
+            return True
+        else:
+            log.error("OpenSSL verification failed: %s %s", out, err)
+            return False
 
-    # 3. mDNS avahi-browse
-    rc_av, out_av, _ = run_command(["avahi-browse", "-t", "-r", "_ipp._tcp"], timeout=8)
-    if rc_av == 0:
-        for ip in re.findall(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", out_av):
-            if ip not in found:
-                found[ip] = {"ip": ip, "uri": f"ipp://{ip}/ipp/print",
-                             "model": "", "source": "mdns"}
-
-    # 4. Model probe
-    from concurrent.futures import ThreadPoolExecutor
-    ips = list(found.keys())
-    with ThreadPoolExecutor(max_workers=min(len(ips)+1, 20)) as pool:
-        for ip, model in pool.map(lambda x: (x, _probe_printer_model(x)), ips):
-            found[ip]["model"] = model or f"Printer @ {ip}"
-
-    printers = list(found.values())
-    logger.info("network_scan: found %d printers", len(printers))
-    return {"status": "ok", "printers": printers,
-            "count": len(printers), "local_ip": local_ip}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Brand-Specific Thermal Install — XP-80 and SPRT (ported from Printers-Tools)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _set_thermal_cut_defaults(printer_name: str) -> None:
-    rc, out, _ = run_command(["lpoptions", "-p", printer_name, "-l"], timeout=5)
-    if rc != 0:
-        return
-    for line in out.splitlines():
-        if re.match(r"^CutType", line, re.IGNORECASE):
-            for tok in line.split():
-                tok = tok.lstrip("*").split("/")[0]
-                if tok.lower() in ("fullcut", "full", "cut"):
-                    run_command(["lpoptions", "-p", printer_name, "-o", f"CutType={tok}"])
-                    run_command(["lpadmin",  "-p", printer_name, "-o", f"CutType={tok}"])
-                    return
-
-
-def _dl(url: str, suffix: str, timeout: int = 120) -> Optional[str]:
-    import urllib.request, tempfile as _tmp
-    try:
-        fd, path = _tmp.mkstemp(suffix=suffix, prefix="it-aman-")
-        os.close(fd)
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            with open(path, "wb") as f:
-                f.write(resp.read())
-        return path if os.path.getsize(path) else None
     except Exception as exc:
-        logger.error("download %s: %s", url, exc)
-        return None
-
-
-def handle_install_thermal_brand(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Download and install brand-specific thermal driver (XP-80 or SPRT).
-    data: { brand: "xprinter"|"sprt", usb_uri: "usb://..." }
-    """
-    brand   = (data.get("brand") or "").lower().strip()
-    usb_uri = (data.get("usb_uri") or "").strip()
-    logger.info("Action: install_thermal_brand brand=%s uri=%s", brand, usb_uri)
-    steps: List[Dict[str, str]] = []
-
-    if brand not in ("xprinter", "sprt"):
-        return {"status": "error", "steps": steps, "message": f"Unknown brand: {brand}"}
-    if not usb_uri:
-        return {"status": "error", "steps": steps,
-                "message": "usb_uri required — run detect_usb_printers first"}
-
-    import time as _time
-
-    # ── XPRINTER XP-80 ───────────────────────────────────────────────────────
-    if brand == "xprinter":
-        pname = XPRINTER_PRINTER_NAME
-        steps.append({"step": "Download XP-80 Driver", "status": "running",
-                       "message": "Downloading from Dropbox..."})
-        dl = _dl(XPRINTER_DRIVER_URL, ".bin")
-        if not dl:
-            steps[-1].update({"status": "failed", "message": "Download failed"})
-            return {"status": "error", "steps": steps}
-        steps[-1].update({"status": "success",
-                           "message": f"Downloaded ({os.path.getsize(dl)//1024} KB)"})
-        try:
-            os.chmod(dl, 0o755)
-        except OSError:
-            pass
-        orig = os.getcwd()
-        try:
-            import tempfile as _tmp2
-            os.chdir(_tmp2.gettempdir())
-            rc_i, _, err_i = run_command([dl], timeout=120)
-        finally:
-            os.chdir(orig)
-            try: os.unlink(dl)
-            except OSError: pass
-        if rc_i != 0:
-            steps.append({"step": "Run Installer", "status": "failed",
-                           "message": err_i or f"exit {rc_i}"})
-            return {"status": "error", "steps": steps}
-        steps.append({"step": "Run Installer", "status": "success", "message": "Done"})
-
-        run_command(["systemctl", "restart", "cups"], timeout=15)
-        _time.sleep(2)
-
-        rc_m, out_m, _ = run_command(["lpinfo", "-m"], timeout=15)
-        ppd = ""
-        for line in (out_m or "").splitlines():
-            if re.search(r"XP-80|XP80|xprinter", line, re.IGNORECASE):
-                ppd = line.split()[0]; break
-        if not ppd:
-            steps.append({"step": "Find PPD", "status": "failed", "message": "PPD not found"})
-            return {"status": "error", "steps": steps}
-        steps.append({"step": "Find PPD", "status": "success", "message": ppd})
-
-        run_command(["lpadmin", "-x", pname], timeout=5)
-        rc_lp, _, err_lp = run_command([
-            "lpadmin", "-p", pname, "-E", "-v", usb_uri,
-            "-m", ppd, "-D", "X-Printer XP-80"], timeout=15)
-        if rc_lp != 0:
-            steps.append({"step": "Register Printer", "status": "failed",
-                           "message": err_lp or "lpadmin failed"})
-            return {"status": "error", "steps": steps}
-        run_command(["cupsenable", pname], timeout=5)
-        run_command(["cupsaccept", pname], timeout=5)
-        _set_thermal_cut_defaults(pname)
-        steps.append({"step": "Register Printer", "status": "success",
-                       "message": f"{pname} ready on {usb_uri}"})
-        return {"status": "ok", "steps": steps,
-                "printer_name": pname, "message": "X-Printer XP-80 installed!"}
-
-    # ── SPRT 80mm ────────────────────────────────────────────────────────────
-    if brand == "sprt":
-        import zipfile, gzip, shutil
-        pname = SPRT_PRINTER_NAME
-        steps.append({"step": "Download SPRT Driver", "status": "running",
-                       "message": "Downloading from Dropbox..."})
-        dl = _dl(SPRT_DRIVER_URL, ".zip")
-        if not dl:
-            steps[-1].update({"status": "failed", "message": "Download failed"})
-            return {"status": "error", "steps": steps}
-        steps[-1].update({"status": "success",
-                           "message": f"Downloaded ({os.path.getsize(dl)//1024} KB)"})
-
-        import tempfile as _tmp3
-        exdir = _tmp3.mkdtemp(prefix="it-aman-sprt-")
-        try:
-            with zipfile.ZipFile(dl, "r") as zf:
-                zf.extractall(exdir)
-            steps.append({"step": "Extract Archive", "status": "success", "message": "OK"})
-        except Exception as exc:
-            # try tar
-            rc_tar, _, _ = run_command(["tar", "-xzf", dl, "-C", exdir], timeout=30)
-            if rc_tar != 0:
-                steps.append({"step": "Extract Archive", "status": "failed", "message": str(exc)})
-                shutil.rmtree(exdir, ignore_errors=True)
-                try: os.unlink(dl)
-                except: pass
-                return {"status": "error", "steps": steps}
-            steps.append({"step": "Extract Archive", "status": "success", "message": "tar OK"})
-        try: os.unlink(dl)
-        except: pass
-
-        # run install.sh if present
-        installer = next(
-            (os.path.join(r, f) for r, _, fs in os.walk(exdir) for f in fs if f == "install.sh"),
-            None)
-        if installer:
-            try: os.chmod(installer, 0o755)
-            except: pass
-            run_command(["bash", installer], timeout=120,
-                        env={**os.environ, "INSTALLER_DIR": os.path.dirname(installer)})
-            steps.append({"step": "Run install.sh", "status": "success", "message": "Done"})
-        else:
-            steps.append({"step": "Run install.sh", "status": "skipped",
-                           "message": "Not found — manual copy"})
-
-        # copy filter binaries
-        filter_dirs = ["/usr/lib/cups/filter", "/usr/local/lib/cups/filter"]
-        for fname in ("rastertoprinter", "rastertoprintercm", "rastertoprinterlm"):
-            src = next(
-                (os.path.join(r, f) for r, _, fs in os.walk(exdir) for f in fs if f == fname),
-                None)
-            if src:
-                for fd in filter_dirs:
-                    os.makedirs(fd, exist_ok=True)
-                    dst = os.path.join(fd, fname)
-                    shutil.copy2(src, dst)
-                    os.chmod(dst, 0o755)
-        steps.append({"step": "Install Filters", "status": "success",
-                       "message": "rastertoprinter placed"})
-
-        # find PPD
-        ppd_src = next(
-            (os.path.join(r, f) for r, _, fs in os.walk(exdir)
-             for f in fs if re.match(r"80mmSeries\.ppd(\.gz)?$", f, re.IGNORECASE)),
-            None)
-        if not ppd_src:
-            ppd_src = next(
-                (os.path.join(r, f) for r, _, fs in os.walk(exdir)
-                 for f in fs if re.search(r"(sprt|80mm|thermal)", f, re.IGNORECASE)
-                 and f.endswith((".ppd", ".ppd.gz"))), None)
-        if not ppd_src:
-            steps.append({"step": "Install PPD", "status": "failed",
-                           "message": "PPD not found in archive"})
-            shutil.rmtree(exdir, ignore_errors=True)
-            return {"status": "error", "steps": steps}
-
-        os.makedirs(os.path.dirname(SPRT_PPD_DEST), exist_ok=True)
-        if ppd_src.endswith(".gz"):
-            with gzip.open(ppd_src, "rb") as gz:
-                with open(SPRT_PPD_DEST, "wb") as f:
-                    f.write(gz.read())
-        else:
-            shutil.copy2(ppd_src, SPRT_PPD_DEST)
-
-        # patch FullCut default
-        try:
-            txt = open(SPRT_PPD_DEST, errors="replace").read()
-            txt = re.sub(r"\*DefaultCutType:.*", "*DefaultCutType: FullCut", txt, flags=re.IGNORECASE)
-            txt = re.sub(r"\*DefaultAutoCut:.*",  "*DefaultAutoCut: FullCut",  txt, flags=re.IGNORECASE)
-            open(SPRT_PPD_DEST, "w").write(txt)
-        except OSError:
-            pass
-        steps.append({"step": "Install PPD", "status": "success",
-                       "message": f"Installed at {SPRT_PPD_DEST}"})
-        shutil.rmtree(exdir, ignore_errors=True)
-
-        run_command(["systemctl", "restart", "cups"], timeout=15)
-        _time.sleep(2)
-
-        run_command(["lpadmin", "-x", pname], timeout=5)
-        rc_lp, _, err_lp = run_command([
-            "lpadmin", "-p", pname, "-E", "-v", usb_uri,
-            "-P", SPRT_PPD_DEST, "-D", "SPRT 80mm Thermal"], timeout=15)
-        if rc_lp != 0:
-            steps.append({"step": "Register Printer", "status": "failed",
-                           "message": err_lp or "lpadmin failed"})
-            return {"status": "error", "steps": steps}
-        run_command(["cupsenable", pname], timeout=5)
-        run_command(["cupsaccept", pname], timeout=5)
-        _set_thermal_cut_defaults(pname)
-        steps.append({"step": "Register Printer", "status": "success",
-                       "message": f"{pname} ready on {usb_uri}"})
-        return {"status": "ok", "steps": steps,
-                "printer_name": pname, "message": "SPRT 80mm installed!"}
-
-    return {"status": "error", "steps": steps, "message": "Unknown brand"}
-
-
-def handle_load_data(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Load and return data.json contents."""
-    data_json = _load_data_json()
-    return {"status": "ok", "data": data_json}
+        log.error("Ed25519 openssl verification error: %s", exc)
+        return False
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
-# Command dispatcher
+# Command dispatch
 # ---------------------------------------------------------------------------
 
 HANDLERS = {
-    "scan": handle_scan,
-    "ping_printer": handle_ping_printer,
+    "ping": handle_ping,
+    "get_version": handle_get_version,
+    "get_config": handle_get_config,
+    "set_language": handle_set_language,
     "fix": handle_fix,
+    "scan": handle_scan,
+    "remove_printer": handle_remove_printer,
+    "quick_fix_spooler": handle_quick_fix_spooler,
+    "network_scan": handle_network_scan,
     "setup_printer": handle_setup_printer,
-    "setup_thermal_usb": handle_setup_thermal_usb,
-    "install_thermal_driver": handle_install_thermal_driver,
+    "install_thermal_brand": handle_install_thermal_brand,
     "detect_usb_printers": handle_detect_usb_printers,
-    "discover_printers":       handle_discover_printers,
-    "network_scan":             handle_network_scan,
-    "install_thermal_brand":    handle_install_thermal_brand,
-    "remove_printer":           handle_remove_printer,
-    "quick_fix_spooler":        handle_quick_fix_spooler,
-    "get_printer_details": handle_get_printer_details,
+    "discover_printers": handle_discover_printers,
     "clear_jobs": handle_clear_jobs,
     "test_print": handle_test_print,
     "update_all": handle_update_all,
-    # NEW: Config management (root writes config for non-root GUI)
-    "save_config": handle_save_config,
-    "get_config": handle_get_config,
-    "set_branch": handle_set_branch,
-    "get_branch": handle_get_branch,
-    # NEW: Data management
-    "load_data": handle_load_data,
 }
 
 
-def dispatch(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Route a JSON command to the appropriate handler."""
-    action = data.get("action", "")
-    handler = HANDLERS.get(action)
+def process_command(data: dict) -> dict:
+    """
+    Process a single JSON command from the GUI.
+    Validates the command against ALLOWED_COMMANDS and dispatches to handler.
+    """
+    command = data.get("command", "")
 
-    if handler is None:
-        logger.warning("Unknown action: %s", action)
-        return {"status": "error", "message": f"Unknown action: {action}"}
+    if not command:
+        return {"status": "error", "message": "No command specified"}
+
+    if command not in ALLOWED_COMMANDS:
+        log.warning("Rejected unknown command: %s", command)
+        return {"status": "error", "message": f"Unknown command: {command}"}
+
+    handler = HANDLERS.get(command)
+    if not handler:
+        return {"status": "error", "message": f"No handler for command: {command}"}
+
+    params = data.get("params", {})
+    if not isinstance(params, dict):
+        params = {}
 
     try:
-        return handler(data)
+        log.info("Handling command: %s", command)
+        result = handler(params)
+        log.info("Command %s completed: %s", command, result.get("status", "unknown"))
+        return result
     except Exception as exc:
-        logger.exception("Unhandled error in handler '%s'", action)
-        return {"status": "error", "message": f"Internal error: {exc}"}
+        log.error("Exception in handler %s: %s", command, exc, exc_info=True)
+        return {"status": "error", "message": f"Handler error: {exc}"}
 
 
 # ---------------------------------------------------------------------------
-# Client handler
+# Unix socket server
 # ---------------------------------------------------------------------------
 
+def recv_message(conn: socket.socket) -> bytes | None:
+    """
+    Receive a length-prefixed message from the socket.
+    Protocol: 4-byte little-endian length prefix, then payload.
+    Returns None on connection close or error.
+    """
+    # Read the 4-byte length prefix
+    raw_len = b""
+    while len(raw_len) < 4:
+        chunk = conn.recv(4 - len(raw_len))
+        if not chunk:
+            return None
+        raw_len += chunk
 
-def handle_client(client_sock: socket.socket, client_addr: str) -> None:
-    """Handle a single client connection."""
-    logger.debug("Client connected: %s", client_addr)
-    response: Dict[str, Any] = {}
+    msg_len = struct.unpack("<I", raw_len)[0]
+    if msg_len == 0:
+        return b""
+    if msg_len > 10_000_000:  # Safety limit: 10 MB
+        log.error("Message too large: %d bytes", msg_len)
+        return None
 
+    # Read the payload
+    data = b""
+    while len(data) < msg_len:
+        chunk = conn.recv(min(msg_len - len(data), SOCKET_RECV_BUF))
+        if not chunk:
+            return None
+        data += chunk
+
+    return data
+
+
+def send_message(conn: socket.socket, data: bytes):
+    """
+    Send a length-prefixed message to the socket.
+    Protocol: 4-byte little-endian length prefix, then payload.
+    """
+    length = struct.pack("<I", len(data))
+    conn.sendall(length + data)
+
+
+def handle_client(conn: socket.socket, addr):
+    """
+    Handle a single client connection.
+    Reads one JSON command, processes it, and sends back the result.
+    """
     try:
-        client_sock.settimeout(30)
-
-        raw = b""
-        while True:
-            chunk = client_sock.recv(65536)
-            if not chunk:
-                break
-            raw += chunk
-            if len(raw) > 1_048_576:
-                response = {"status": "error", "message": "Request too large"}
-                client_sock.sendall(json.dumps(response).encode("utf-8") + b"\n")
-                return
-            if b"\n" in raw:
-                break
-        if not raw:
+        conn.settimeout(30)  # Client must send within 30 seconds
+        raw = recv_message(conn)
+        if raw is None:
             return
 
+        # Decode JSON
         try:
-            text = raw.decode("utf-8").strip()
-        except UnicodeDecodeError:
-            response = {"status": "error", "message": "Invalid UTF-8 encoding"}
-            client_sock.sendall(json.dumps(response).encode("utf-8") + b"\n")
-            return
-
-        try:
-            data = json.loads(text)
+            data = json.loads(raw.decode("utf-8"))
         except json.JSONDecodeError as exc:
+            log.warning("Invalid JSON from client: %s", exc)
             response = {"status": "error", "message": f"Invalid JSON: {exc}"}
-            client_sock.sendall(json.dumps(response).encode("utf-8") + b"\n")
+            send_message(conn, json.dumps(response).encode("utf-8"))
             return
 
-        logger.info("Received command: %s", json.dumps(data, ensure_ascii=False))
-        response = dispatch(data)
+        # Process the command
+        result = process_command(data)
+
+        # Send response
+        send_message(conn, json.dumps(result).encode("utf-8"))
 
     except socket.timeout:
-        response = {"status": "error", "message": "Request timed out"}
+        log.warning("Client connection timed out")
     except ConnectionResetError:
-        return
-    except OSError as exc:
-        response = {"status": "error", "message": f"Connection error: {exc}"}
+        log.debug("Client disconnected")
     except Exception as exc:
-        response = {"status": "error", "message": f"Unexpected error: {exc}"}
-
-    try:
-        response_bytes = json.dumps(response, ensure_ascii=False).encode("utf-8") + b"\n"
-        client_sock.sendall(response_bytes)
-    except OSError as exc:
-        logger.error("Failed to send response to %s: %s", client_addr, exc)
+        log.error("Error handling client: %s", exc, exc_info=True)
     finally:
         try:
-            client_sock.close()
-        except OSError:
+            conn.close()
+        except Exception:
             pass
 
 
-# ---------------------------------------------------------------------------
-# Thread wrapper
-# ---------------------------------------------------------------------------
+def run_socket_server():
+    """
+    Main socket server loop.
+    Listens on SOCKET_PATH and spawns threads for each connection.
+    """
+    # Ensure socket directory exists
+    socket_dir = os.path.dirname(SOCKET_PATH)
+    os.makedirs(socket_dir, exist_ok=True)
 
-
-def client_thread_target(client_sock: socket.socket, client_addr: str) -> None:
-    """Wrapper for client handler threads."""
-    try:
-        handle_client(client_sock, client_addr)
-    finally:
-        current = threading.current_thread()
-        with active_threads_lock:
-            try:
-                active_threads.remove(current)
-            except ValueError:
-                pass
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-
-def main() -> None:
-    """Entry point."""
-    global server_socket
-
-    logger.info("IT Aman Daemon v3.0 starting up (PID %d)", os.getpid())
-
-    if os.geteuid() != 0:
-        logger.error("This daemon must run as root. Current UID: %d", os.geteuid())
-        sys.exit(1)
-
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
-
-    os.makedirs(SOCKET_DIR, exist_ok=True)
-
+    # Remove stale socket file
     if os.path.exists(SOCKET_PATH):
-        try:
-            os.unlink(SOCKET_PATH)
-        except OSError as exc:
-            logger.error("Cannot remove stale socket: %s", exc)
-            sys.exit(1)
+        os.remove(SOCKET_PATH)
 
-    server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # Create Unix socket
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(SOCKET_PATH)
+    os.chmod(SOCKET_PATH, 0o660)  # Root group only
+    server.listen(10)
+    log.info("Listening on %s", SOCKET_PATH)
+
+    # Write PID file
+    os.makedirs(os.path.dirname(PID_PATH), exist_ok=True)
+    with open(PID_PATH, "w") as fh:
+        fh.write(str(os.getpid()))
 
     try:
-        server_socket.bind(SOCKET_PATH)
+        while True:
+            try:
+                conn, _ = server.accept()
+                # Handle each client in a separate thread
+                t = threading.Thread(target=handle_client, args=(conn, None), daemon=True)
+                t.start()
+            except OSError as exc:
+                if exc.errno == 4:  # Interrupted system call
+                    continue
+                raise
+    except KeyboardInterrupt:
+        log.info("Received KeyboardInterrupt — shutting down")
+    finally:
+        server.close()
+        if os.path.exists(SOCKET_PATH):
+            os.remove(SOCKET_PATH)
+        if os.path.exists(PID_PATH):
+            os.remove(PID_PATH)
+        log.info("Socket server stopped")
+
+
+# ---------------------------------------------------------------------------
+# Signal handlers
+# ---------------------------------------------------------------------------
+
+def _signal_handler(signum, frame):
+    """Handle termination signals gracefully."""
+    sig_name = signal.Signals(signum).name
+    log.info("Received signal %s — shutting down", sig_name)
+
+    # Clean up socket
+    if os.path.exists(SOCKET_PATH):
+        os.remove(SOCKET_PATH)
+    if os.path.exists(PID_PATH):
+        os.remove(PID_PATH)
+
+    sys.exit(0)
+
+
+def setup_signal_handlers():
+    """Register signal handlers for graceful shutdown."""
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+    # Ignore SIGHUP (don't die if terminal closes)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+
+# ---------------------------------------------------------------------------
+# Daemonization
+# ---------------------------------------------------------------------------
+
+def daemonize():
+    """
+    Double-fork to daemonize the process.
+    Detaches from terminal, redirects stdio to /dev/null.
+    """
+    # First fork
+    try:
+        pid = os.fork()
+        if pid > 0:
+            # Parent exits
+            sys.exit(0)
     except OSError as exc:
-        logger.error("Cannot bind socket %s: %s", SOCKET_PATH, exc)
+        log.error("First fork failed: %s", exc)
         sys.exit(1)
 
-    os.chmod(SOCKET_PATH, 0o666)
-    server_socket.listen(16)
-    logger.info("Listening on %s", SOCKET_PATH)
+    # Create new session
+    os.setsid()
 
-    while not shutdown_event.is_set():
-        try:
-            server_socket.settimeout(1.0)
-            try:
-                client_sock, _ = server_socket.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-
-            t = threading.Thread(
-                target=client_thread_target,
-                args=(client_sock, f"client-{threading.active_count()}"),
-                daemon=True,
-            )
-            t.start()
-            with active_threads_lock:
-                active_threads.append(t)
-
-        except Exception as exc:
-            if shutdown_event.is_set():
-                break
-            logger.exception("Error accepting connection: %s", exc)
-
-    logger.info("Shutting down...")
-
-    with active_threads_lock:
-        remaining = list(active_threads)
-    for t in remaining:
-        if t.is_alive():
-            t.join(timeout=5.0)
-
+    # Second fork
     try:
-        if os.path.exists(SOCKET_PATH):
-            os.unlink(SOCKET_PATH)
-    except OSError:
-        pass
+        pid = os.fork()
+        if pid > 0:
+            sys.exit(0)
+    except OSError as exc:
+        log.error("Second fork failed: %s", exc)
+        sys.exit(1)
 
-    logger.info("IT Aman Daemon stopped.")
+    # Redirect standard file descriptors to /dev/null
+    devnull = os.open(os.devnull, os.O_RDWR)
+    os.dup2(devnull, 0)  # stdin
+    os.dup2(devnull, 1)  # stdout
+    os.dup2(devnull, 2)  # stderr
+    os.close(devnull)
+
+    # Ensure we don't create files with world-readable permissions
+    os.umask(0o022)
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight checks
+# ---------------------------------------------------------------------------
+
+def preflight_checks():
+    """Run pre-flight checks before starting the daemon."""
+    # Must run as root
+    if os.geteuid() != 0:
+        print("ERROR: This daemon must run as root", file=sys.stderr)
+        sys.exit(1)
+
+    # Ensure CUPS is installed
+    rc, _, _ = run_cmd(["which", "cupsd"])
+    if rc != 0:
+        log.warning("cupsd not found — CUPS may not be installed")
+
+    # Create necessary directories
+    for path in [CONFIG_DIR, LOG_DIR, os.path.dirname(SOCKET_PATH)]:
+        os.makedirs(path, exist_ok=True)
+
+    # Initialize config if not present
+    if not os.path.isfile(CONFIG_PATH):
+        save_config(DEFAULT_CONFIG)
+
+    log.info("Pre-flight checks passed")
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    """Main entry point for the IT Aman Printer Daemon."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="IT Aman Printer Daemon v3.4")
+    parser.add_argument(
+        "--foreground", "-f",
+        action="store_true",
+        help="Run in foreground (don't daemonize)",
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose/debug logging to console",
+    )
+    args = parser.parse_args()
+
+    log.info("=" * 60)
+    log.info("IT Aman Printer Daemon v%s starting", VERSION)
+    log.info("=" * 60)
+
+    # Pre-flight checks
+    preflight_checks()
+
+    # Setup signal handlers
+    setup_signal_handlers()
+
+    # Daemonize unless foreground mode
+    if not args.foreground:
+        daemonize()
+        log.info("Daemonized — PID %d", os.getpid())
+
+    # If verbose, increase console log level
+    if args.verbose:
+        for handler in log.handlers:
+            if isinstance(handler, logging.StreamHandler):
+                handler.setLevel(logging.DEBUG)
+
+    # Start the socket server (blocking)
+    try:
+        run_socket_server()
+    except Exception as exc:
+        log.critical("Fatal error in socket server: %s", exc, exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
