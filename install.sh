@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
-# IT Aman Printer Tool v3.9 — Installation Script
+# IT Aman Printer Tool v3.10 — Installation Script
 # ═══════════════════════════════════════════════════════════
 
 set -e
@@ -15,7 +15,7 @@ SERVICE_FILE="/etc/systemd/system/it-aman.service"
 DESKTOP_FILE="/usr/share/applications/it-aman.desktop"
 
 echo "========================================"
-echo " IT Aman Printer Tool v3.9 Installer"
+echo " IT Aman Printer Tool v3.10 Installer"
 echo "========================================"
 echo ""
 
@@ -106,7 +106,7 @@ sleep 2
 
 if systemctl is-active --quiet it-aman.service; then
     echo ""
-    echo "✅ IT Aman Printer Tool v3.9 installed successfully!"
+    echo "✅ IT Aman Printer Tool v3.10 installed successfully!"
     echo ""
     echo "  Daemon: ACTIVE (running in background)"
     echo "  Socket: $SOCKET_DIR/it-aman.sock"

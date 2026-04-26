@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IT Aman Printer Support Tool v3.8 — GTK3 Frontend
+IT Aman Printer Support Tool v3.10 — GTK3 Frontend
 
 Communicates with it-aman daemon via Unix socket.
 Language is selected once at startup and locked for the session.
 No branch selection — works directly with network printers.
+Developed by IT Helpdesk Operation.
+
+Key fixes in v3.10:
+  - Fixed USB thermal printer detection check in wizard step 3
+  - Fixed pulse_loop to stop when progress bar is destroyed
+  - Fixed update notification to use proper version comparison
 """
 
 import gi
@@ -22,7 +28,7 @@ import subprocess
 
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
 CONFIG_PATH = "/etc/it-aman/config.json"
-APP_VERSION = "3.9"
+APP_VERSION = "3.10"
 APP_NAME = "IT Aman - Printer Support Tool"
 DEVELOPER = "Developed by: IT Helpdesk Operation"
 
@@ -665,12 +671,15 @@ def icon_button(icon_name, label_text, css_class="btn-primary"):
 
 
 def pulse_loop(progress_bar):
-    """Repeatedly pulse a progress bar until the bar is destroyed."""
+    """Repeatedly pulse a progress bar until the bar is destroyed or hidden."""
     try:
+        if not progress_bar.get_realized():
+            return False
         progress_bar.pulse()
         GLib.timeout_add(100, pulse_loop, progress_bar)
+        return True
     except Exception:
-        pass
+        return False
 
 
 # ──────────────────────────── Screen: Welcome ────────────────────────────
@@ -1542,15 +1551,22 @@ class ThermalPrinterScreen(Gtk.Box):
         except Exception:
             pass
 
-        if result.get("status") == "ok":
+        # FIX: Check both status AND that printers were actually found.
+        # Previously, status "ok" with empty printers list was treated as detected.
+        printers = result.get("printers", [])
+        if result.get("status") == "ok" and printers:
             self.usb_detected = True
             self.usb_status.set_markup(
                 f"<span size='large' weight='bold' color='#4CAF50'>"
                 f"{t('thermal_step3_found', lang)}</span>"
             )
             self.usb_icon.set_from_icon_name("emblem-default", Gtk.IconSize.DIALOG)
+            # Store the USB URI for driver installation
+            self._usb_uri = printers[0].get("uri", printers[0].get("full_uri", ""))
+            self._usb_description = printers[0].get("description", "USB Printer")
         else:
             self.usb_detected = False
+            msg = result.get("message", t('thermal_step3_not_found', lang))
             self.usb_status.set_markup(
                 f"<span size='large' weight='bold' color='#F44336'>"
                 f"{t('thermal_step3_not_found', lang)}</span>"
@@ -2428,11 +2444,11 @@ class ITAmanApp(Gtk.Window):
 
     def _on_update_check_result(self, result):
         if result.get("status") == "ok":
+            update_available = result.get("update_available", False)
             latest = result.get("version", APP_VERSION)
-            if latest != APP_VERSION:
-                # Only show if user hasn't already dismissed this version
-                if latest != self._update_dismissed_version:
-                    self._show_update_banner(latest)
+            # FIX: Use the daemon's proper version comparison instead of string !=
+            if update_available and latest != self._update_dismissed_version:
+                self._show_update_banner(latest)
             else:
                 # Up to date — hide banner if showing
                 self._hide_update_banner()

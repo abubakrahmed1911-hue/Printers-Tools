@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
 """
-IT Aman Printer Daemon v3.8
-============================
+IT Aman Printer Daemon v3.10
+=============================
 A Unix socket daemon for managing CUPS printers on Linux.
 Runs as root, listens on /run/it-aman/it-aman.sock, and processes
 JSON commands from the GTK3 GUI client.
+Developed by IT Helpdesk Operation.
 
-Key changes from v3.7:
-  - VERSION bumped to 3.8
-  - Removed duplicate entries in ALLOWED_COMMANDS set
-  - Fixed handle_discover_printers to query lpstat -p for all installed
-    printers and return consistent format (name, state, device, jobs)
-  - Fixed handle_quick_fix_spooler: safer approach — restart CUPS first,
-    cancel stuck jobs, only clear spool as last resort
-  - Fixed handle_remove_printer: removed dangerous cupsdisable before
-    lpadmin -x that could leave printer disabled on failure
-  - Enhanced handle_detect_usb_printers: added lsusb parsing, /dev/usb/lp*
-    device check, udevadm usb_printer_id check, and thorough usb:// URI scan
-  - Fixed handle_check_update to return both remote version and whether
-    update is available (comparison with local VERSION)
-  - Updated docstring from v3.4 to v3.8
-  - User-Agent strings now use VERSION constant instead of hardcoded "3.4"
-  - Added handle_list_installed_printers for GUI Repair/Status/Remove screens
+Key changes from v3.9:
+  - CRITICAL FIX: process_command now merges top-level JSON keys into
+    params dict. Previously, GUI sent params like {"action": "repair_printer",
+    "name": "HP"} but handlers expected data["params"]["name"]. This caused
+    ALL parameterized commands (repair, remove, setup, thermal) to fail.
+  - Fixed handle_detect_usb_printers: returns error status when no USB
+    printers found, so thermal wizard correctly shows "not detected"
+  - Added CUPS safety check after every CUPS-modifying command to ensure
+    CUPS stays running and is never accidentally left in stopped state
+  - VERSION bumped to 3.10
 
 Architecture:
   - Unix socket at /run/it-aman/it-aman.sock
@@ -57,7 +52,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "3.9"
+VERSION = "3.10"
 
 # Paths
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
@@ -1885,6 +1880,10 @@ def handle_detect_usb_printers(params: dict) -> dict:
                     })
 
     log.info("Detected %d USB printers", len(printers))
+    # Return error status when no USB printers found so the GUI thermal
+    # wizard can correctly show "not detected" instead of "detected".
+    if not printers:
+        return {"status": "error", "message": "No USB printers detected", "printers": []}
     return {"status": "ok", "printers": printers}
 
 
@@ -2473,6 +2472,11 @@ def process_command(data: dict) -> dict:
     Process a single JSON command from the GUI.
     Accepts both "action" and "command" keys.
     Validates the command against ALLOWED_COMMANDS and dispatches to handler.
+
+    IMPORTANT: The GUI sends parameters at the top level of the JSON dict
+    (e.g. {"action": "repair_printer", "name": "HP"}), but handlers expect
+    them under the "params" key. This function merges top-level keys into
+    params so both formats work.
     """
     # Accept both "action" (from GUI) and "command" (internal)
     command = data.get("action", "") or data.get("command", "")
@@ -2491,17 +2495,43 @@ def process_command(data: dict) -> dict:
     if not handler:
         return {"status": "error", "message": f"No handler for command: {command}"}
 
+    # Extract params from the "params" key first
     params = data.get("params", {})
     if not isinstance(params, dict):
         params = {}
 
+    # CRITICAL FIX: Merge top-level keys (except reserved ones) into params.
+    # The GUI sends parameters like {"action": "repair_printer", "name": "HP"}
+    # but handlers expect params = {"name": "HP"}. Without this merge,
+    # ALL parameterized commands (repair, remove, setup, thermal) fail silently.
+    reserved_keys = {"action", "command", "params"}
+    for key, value in data.items():
+        if key not in reserved_keys and key not in params:
+            params[key] = value
+
     try:
-        log.info("Handling command: %s", command)
+        log.info("Handling command: %s (params: %s)", command, list(params.keys()))
         result = handler(params)
         log.info("Command %s completed: %s", command, result.get("status", "unknown"))
+
+        # SAFETY: After any CUPS-modifying command, ensure CUPS is still running.
+        # This prevents the daemon from accidentally leaving CUPS in a stopped state.
+        cups_modifying_commands = {
+            "fix", "quick_fix_spooler", "setup_printer", "remove_printer",
+            "repair_printer", "install_thermal_brand", "clear_jobs",
+        }
+        if command in cups_modifying_commands:
+            if not cups_is_running():
+                log.warning("CUPS not running after '%s' -- restarting", command)
+                cups_start()
+
         return result
     except Exception as exc:
         log.error("Exception in handler %s: %s", command, exc, exc_info=True)
+        # Ensure CUPS is still running even after handler errors
+        if not cups_is_running():
+            log.warning("CUPS not running after handler error -- restarting")
+            cups_start()
         return {"status": "error", "message": f"Handler error: {exc}"}
 
 
