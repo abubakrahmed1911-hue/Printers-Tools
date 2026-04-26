@@ -1577,11 +1577,17 @@ def handle_update_all(params: dict) -> dict:
     Check for and apply updates from the public GitHub repository.
     NO token needed — repo is public, uses raw.githubusercontent.com URLs.
 
-    Process:
+    Simple update process (no manifest/signature needed for public repo):
       1. Download version.json from raw.githubusercontent.com
       2. Compare versions
-      3. Download update_manifest.json, verify Ed25519 signature
-      4. Download new files, replace, restart daemon
+      3. Download all known files directly from GitHub
+      4. Replace local files, restart daemon
+
+    To release an update:
+      1. Edit files locally
+      2. Change VERSION in daemon.py
+      3. Change version in version.json
+      4. git add -A && git commit -m "v3.5" && git push
     """
     report = {"status": "ok", "actions": []}
 
@@ -1610,110 +1616,70 @@ def handle_update_all(params: dict) -> dict:
 
     log.info("Update available: %s -> %s", VERSION, remote_version)
 
-    # --- Step 2: Fetch update manifest ---
-    manifest_url = f"{RAW_BASE}/update_manifest.json"
-    manifest_text = download_text(manifest_url)
-    if not manifest_text:
-        return {"status": "error", "message": "Failed to fetch update_manifest.json"}
+    # --- Step 2: Download all known files ---
+    # Files that make up the application (relative to repo root)
+    UPDATE_FILES = [
+        "src/daemon.py",
+        "src/gui.py",
+        "version.json",
+        "public.pem",
+        ".gitignore",
+    ]
 
-    try:
-        manifest = json.loads(manifest_text)
-    except json.JSONDecodeError as exc:
-        return {"status": "error", "message": f"Invalid update_manifest.json: {exc}"}
-
-    # --- Step 3: Verify Ed25519 signature ---
-    signature_b64 = manifest.get("signature", "")
-    public_key_b64 = manifest.get("public_key", "")
-    files_list = manifest.get("files", [])
-
-    if not signature_b64 or not public_key_b64:
-        return {"status": "error", "message": "Update manifest missing signature or public_key"}
-
-    if not files_list:
-        return {"status": "error", "message": "Update manifest has no files to update"}
-
-    # Verify signature
-    try:
-        sig_valid = _verify_ed25519_signature(
-            public_key_b64, signature_b64, files_list
-        )
-        if not sig_valid:
-            return {"status": "error", "message": "Ed25519 signature verification FAILED — update rejected"}
-        report["actions"].append("Ed25519 signature verified")
-    except Exception as exc:
-        return {"status": "error", "message": f"Signature verification error: {exc}"}
-
-    # --- Step 4: Download and replace files ---
     install_dir = os.path.dirname(os.path.abspath(__file__))
-    backup_dir = install_dir + ".backup"
+    # Parent dir holds version.json, public.pem, etc.
+    base_dir = os.path.dirname(install_dir)  # /opt/it-aman
+    backup_dir = base_dir + ".backup"
 
     # Create backup of current files
     try:
         if os.path.exists(backup_dir):
             shutil.rmtree(backup_dir)
-        shutil.copytree(install_dir, backup_dir)
+        shutil.copytree(base_dir, backup_dir)
         report["actions"].append(f"Backed up current files to {backup_dir}")
     except Exception as exc:
         return {"status": "error", "message": f"Failed to create backup: {exc}"}
 
     # Download each file
     updated_files = []
-    for file_info in files_list:
-        remote_path = file_info.get("path", "")
-        expected_sha256 = file_info.get("sha256", "")
-        if not remote_path:
-            continue
-
-        # Only update files within our src directory (security: no path traversal)
-        basename = os.path.basename(remote_path)
-        dest_path = os.path.join(install_dir, basename)
+    for remote_path in UPDATE_FILES:
         download_url = f"{RAW_BASE}/{remote_path}"
+        dest_path = os.path.join(base_dir, remote_path)
 
         log.info("Downloading update: %s -> %s", download_url, dest_path)
 
         tmp_dest = dest_path + ".new"
-        if not download_file(download_url, tmp_dest, basename):
-            report["actions"].append(f"Failed to download {basename}")
+        if not download_file(download_url, tmp_dest, remote_path):
+            report["actions"].append(f"Failed to download {remote_path}")
             continue
-
-        # Verify SHA256 if provided
-        if expected_sha256:
-            actual_sha256 = _sha256_file(tmp_dest)
-            if actual_sha256 != expected_sha256:
-                log.error(
-                    "SHA256 mismatch for %s: expected %s, got %s",
-                    basename, expected_sha256, actual_sha256,
-                )
-                os.remove(tmp_dest)
-                report["actions"].append(f"SHA256 mismatch for {basename} — skipped")
-                continue
 
         # Replace the file
         try:
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
             os.replace(tmp_dest, dest_path)
-            updated_files.append(basename)
-            report["actions"].append(f"Updated: {basename}")
+            updated_files.append(remote_path)
+            report["actions"].append(f"Updated: {remote_path}")
         except Exception as exc:
-            log.error("Failed to replace %s: %s", basename, exc)
-            report["actions"].append(f"Failed to replace {basename}: {exc}")
+            log.error("Failed to replace %s: %s", remote_path, exc)
+            report["actions"].append(f"Failed to replace {remote_path}: {exc}")
             if os.path.isfile(tmp_dest):
                 os.remove(tmp_dest)
 
     if not updated_files:
         # Restore backup since nothing was updated
         try:
-            shutil.rmtree(install_dir)
-            shutil.copytree(backup_dir, install_dir)
+            shutil.rmtree(base_dir)
+            shutil.copytree(backup_dir, base_dir)
         except Exception:
             pass
         return {"status": "error", "message": "No files were successfully updated", "actions": report["actions"]}
 
-    # --- Step 5: Update config with new version ---
+    # --- Step 3: Update config with new version ---
     cfg = load_config()
     cfg["version"] = remote_version
     save_config(cfg)
 
-    # --- Step 6: Restart daemon ---
+    # --- Step 4: Restart daemon ---
     report["actions"].append(f"Updated {len(updated_files)} file(s)")
     report["actions"].append("Daemon will restart to apply updates")
     report["new_version"] = remote_version
