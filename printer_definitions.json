@@ -1,0 +1,45 @@
+{
+  "version": "1.0",
+  "description": "Centralized printer definitions for IT Aman Printer Tool. Edit this file on GitHub to push definitions to ALL devices.",
+  "name_templates": [
+    "Operation MF",
+    "Accountant MF",
+    "FS",
+    "HR MF",
+    "Reception MF",
+    "Manager MF",
+    "IT MF",
+    "GM MF",
+    "Operation 2 MF",
+    "Accountant 2 MF",
+    "FS2",
+    "FS3",
+    "FS4",
+    "HR 2 MF",
+    "Reception 2 MF",
+    "Manager 2 MF",
+    "IT 2 MF",
+    "Operation 3 MF",
+    "Accountant 3 MF",
+    "FS5",
+    "FS6"
+  ],
+  "printers": [],
+  "thermal_drivers": {
+    "xprinter": {
+      "brand": "xprinter",
+      "model": "XP-80",
+      "description": "XPrinter XP-80 80mm thermal printer"
+    },
+    "sprt": {
+      "brand": "sprt",
+      "model": "SPRT",
+      "description": "SPRT 80mm thermal printer"
+    }
+  },
+  "instructions": {
+    "add_network_printer": "Add entries to the 'printers' array like: {\"name\": \"Operation MF\", \"ip\": \"192.168.1.50\", \"model\": \"Kyocera ECOSYS\", \"type\": \"network\"}",
+    "add_thermal_printer": "Add entries like: {\"name\": \"FS\", \"type\": \"thermal\", \"brand\": \"xprinter\"}",
+    "name_templates": "Edit the 'name_templates' array to change available printer names. Names with numbers (FS2, FS3, Operation 2 MF) are auto-generated when duplicates exist."
+  }
+}
