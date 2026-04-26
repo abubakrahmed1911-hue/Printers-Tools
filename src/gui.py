@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IT Aman Printer Support Tool v3.4 — GTK3 Frontend
+IT Aman Printer Support Tool v3.8 — GTK3 Frontend
 
 Communicates with it-aman daemon via Unix socket.
 Language is selected once at startup and locked for the session.
@@ -22,7 +22,7 @@ import subprocess
 
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
 CONFIG_PATH = "/etc/it-aman/config.json"
-APP_VERSION = "3.7"
+APP_VERSION = "3.8"
 APP_NAME = "IT Aman - Printer Support Tool"
 DEVELOPER = "Developed by: IT Helpdesk Operation"
 
@@ -955,8 +955,10 @@ class DiagnosticScreen(Gtk.Box):
         status = result.get("status", "error")
 
         if status == "ok":
-            fixes = result.get("fixes", [])
-            if not fixes:
+            # Daemon returns "actions" list (not "fixes")
+            actions = result.get("actions", result.get("fixes", []))
+            issues_found = result.get("issues_found", 0)
+            if not actions or issues_found == 0:
                 self.status_lbl.set_markup(
                     f"<span size='large' weight='bold' color='#4CAF50'>"
                     f"{t('diag_nothing', lang)}</span>"
@@ -967,9 +969,9 @@ class DiagnosticScreen(Gtk.Box):
                     f"{t('diag_fixed', lang)}</span>"
                 )
                 xalign = 0.0 if lang != "ar" else 1.0
-                for fix in fixes:
+                for action in actions:
                     lbl = Gtk.Label()
-                    lbl.set_markup(f"  ✓ {fix}")
+                    lbl.set_markup(f"  ✓ {action}")
                     lbl.set_xalign(xalign)
                     self.results_box.pack_start(lbl, False, False, 2)
         else:
@@ -1198,7 +1200,7 @@ class NetworkPrinterScreen(Gtk.Box):
         self.show_all()
 
         self.remove_spinner.start()
-        self.app.daemon.send_threaded({"action": "list_printers"}, self._on_remove_list)
+        self.app.daemon.send_threaded({"action": "list_installed_printers"}, self._on_remove_list)
 
     def _on_remove_list(self, result):
         lang = self.app.lang
@@ -1672,7 +1674,7 @@ class ThermalPrinterScreen(Gtk.Box):
         self.show_all()
 
         self.rm_spinner.start()
-        self.app.daemon.send_threaded({"action": "list_printers"}, self._on_rm_list)
+        self.app.daemon.send_threaded({"action": "list_installed_printers"}, self._on_rm_list)
 
     def _on_rm_list(self, result):
         lang = self.app.lang
@@ -1796,7 +1798,7 @@ class RepairScreen(Gtk.Box):
         self.pack_start(self.status_lbl, False, False, 0)
 
         self.spinner.start()
-        self.app.daemon.send_threaded({"action": "list_printers"}, self._on_list)
+        self.app.daemon.send_threaded({"action": "list_installed_printers"}, self._on_list)
 
     def _on_list(self, result):
         lang = self.app.lang
@@ -1842,6 +1844,7 @@ class RepairScreen(Gtk.Box):
             name_lbl.set_xalign(0.0 if lang != "ar" else 1.0)
             info.pack_start(name_lbl, False, False, 0)
 
+            # Show state for ALL printers, not just disabled
             if state in ("disabled", "stopped"):
                 state_lbl = Gtk.Label()
                 state_lbl.set_markup(
@@ -1849,6 +1852,21 @@ class RepairScreen(Gtk.Box):
                 )
                 state_lbl.set_xalign(0.0 if lang != "ar" else 1.0)
                 info.pack_start(state_lbl, False, False, 0)
+            elif state in ("enabled", "idle", "processing"):
+                state_lbl = Gtk.Label()
+                state_lbl.set_markup(
+                    f"<span color='#4CAF50'>{t('status_enabled', lang)}</span>"
+                )
+                state_lbl.set_xalign(0.0 if lang != "ar" else 1.0)
+                info.pack_start(state_lbl, False, False, 0)
+
+            # Show device URI
+            device = prn.get("device", "")
+            if device:
+                dev_lbl = Gtk.Label()
+                dev_lbl.set_markup(f"<span size='small' color='#757575'>{device}</span>")
+                dev_lbl.set_xalign(0.0 if lang != "ar" else 1.0)
+                info.pack_start(dev_lbl, False, False, 0)
 
             card.pack_start(info, True, True, 0)
 
@@ -1867,10 +1885,19 @@ class RepairScreen(Gtk.Box):
                     except Exception:
                         pass
                     if res.get("status") == "ok":
-                        self.status_lbl.set_markup(
-                            f"<span color='#4CAF50' weight='bold'>"
-                            f"{t('repair_done', lang)}</span>"
-                        )
+                        # Show all actions from the repair
+                        actions = res.get("actions", [])
+                        if actions:
+                            self.status_lbl.set_markup(
+                                f"<span color='#4CAF50' weight='bold'>"
+                                f"{t('repair_done', lang)}<br/>" +
+                                "<br/>".join(actions) + "</span>"
+                            )
+                        else:
+                            self.status_lbl.set_markup(
+                                f"<span color='#4CAF50' weight='bold'>"
+                                f"{t('repair_done', lang)}</span>"
+                            )
                         btn.set_label(f"✓ {t('done', lang)}")
                         btn.get_style_context().add_class("btn-success")
                     else:
@@ -1999,7 +2026,7 @@ class StatusScreen(Gtk.Box):
         self.pack_start(scrolled, True, True, 0)
 
         self.spinner.start()
-        self.app.daemon.send_threaded({"action": "list_printers"}, self._on_list)
+        self.app.daemon.send_threaded({"action": "list_installed_printers"}, self._on_list)
 
     def _on_list(self, result):
         lang = self.app.lang

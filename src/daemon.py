@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
 """
-IT Aman Printer Daemon v3.4
+IT Aman Printer Daemon v3.8
 ============================
 A Unix socket daemon for managing CUPS printers on Linux.
 Runs as root, listens on /run/it-aman/it-aman.sock, and processes
 JSON commands from the GTK3 GUI client.
 
-Key changes from v3.3:
-  - Removed branches system (set_branch, get_branch, data.json handlers)
-  - Updated GITHUB_REPO to "abubakrahmed1911-hue/Printers-Tools"
-  - Update system uses raw.githubusercontent.com (public repo, no token)
-  - Network printer setup: IPP Everywhere first, then LPD+driver fallback
-  - Simplified config (version + language only)
-  - Kept thermal brand install (XP-80, SPRT) and Kyocera auto-install
+Key changes from v3.7:
+  - VERSION bumped to 3.8
+  - Removed duplicate entries in ALLOWED_COMMANDS set
+  - Fixed handle_discover_printers to query lpstat -p for all installed
+    printers and return consistent format (name, state, device, jobs)
+  - Fixed handle_quick_fix_spooler: safer approach — restart CUPS first,
+    cancel stuck jobs, only clear spool as last resort
+  - Fixed handle_remove_printer: removed dangerous cupsdisable before
+    lpadmin -x that could leave printer disabled on failure
+  - Enhanced handle_detect_usb_printers: added lsusb parsing, /dev/usb/lp*
+    device check, udevadm usb_printer_id check, and thorough usb:// URI scan
+  - Fixed handle_check_update to return both remote version and whether
+    update is available (comparison with local VERSION)
+  - Updated docstring from v3.4 to v3.8
+  - User-Agent strings now use VERSION constant instead of hardcoded "3.4"
+  - Added handle_list_installed_printers for GUI Repair/Status/Remove screens
 
 Architecture:
   - Unix socket at /run/it-aman/it-aman.sock
@@ -48,7 +57,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "3.6"
+VERSION = "3.8"
 
 # Paths
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
@@ -58,7 +67,7 @@ LOG_DIR = "/var/log/it-aman"
 LOG_PATH = os.path.join(LOG_DIR, "daemon.log")
 PID_PATH = "/run/it-aman/it-aman.pid"
 
-# GitHub update URLs (public repo — no token required)
+# GitHub update URLs (public repo -- no token required)
 GITHUB_REPO = "abubakrahmed1911-hue/Printers-Tools"
 RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main"
 
@@ -97,7 +106,10 @@ SOCKET_RECV_BUF = 65536
 AUTO_UPDATE_INTERVAL = 60       # seconds between checks (1 minute)
 AUTO_UPDATE_ENABLED = True      # set to False to disable background auto-update
 
-# Allowed commands whitelist — anything not listed is rejected
+# User-Agent for HTTP requests (uses VERSION constant)
+_USER_AGENT = f"IT-Aman-Daemon/{VERSION}"
+
+# Allowed commands whitelist -- anything not listed is rejected
 ALLOWED_COMMANDS = {
     "fix",
     "scan",
@@ -115,17 +127,8 @@ ALLOWED_COMMANDS = {
     "get_version",
     "get_config",
     "set_language",
-    # GUI action aliases (also accepted)
-    "diagnose",
-    "scan_network",
-    "add_network_printer",
-    "install_thermal_driver",
-    "fix_spooler",
-    "detect_usb_printer",
-    "list_printers",
-    "repair_printer",
-    "update",
     "check_update",
+    "list_installed_printers",
     # GUI action aliases (also accepted)
     "diagnose",
     "scan_network",
@@ -148,7 +151,7 @@ def setup_logging():
     logger = logging.getLogger("it-aman")
     logger.setLevel(logging.DEBUG)
 
-    # Rotating file handler — 2 MB per file, keep 5 backups
+    # Rotating file handler -- 2 MB per file, keep 5 backups
     fh = logging.handlers.RotatingFileHandler(
         LOG_PATH, maxBytes=2_000_000, backupCount=5
     )
@@ -191,7 +194,7 @@ def load_config() -> dict:
             merged = {**DEFAULT_CONFIG, **cfg}
             return merged
     except Exception as exc:
-        log.warning("Failed to load config: %s — using defaults", exc)
+        log.warning("Failed to load config: %s -- using defaults", exc)
     return dict(DEFAULT_CONFIG)
 
 
@@ -257,7 +260,7 @@ def download_file(url: str, dest: str, desc: str = "file") -> bool:
     try:
         os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
         req = urllib.request.Request(url, headers={
-            "User-Agent": "IT-Aman-Daemon/3.4",
+            "User-Agent": _USER_AGENT,
         })
         with urllib.request.urlopen(req, timeout=120) as resp:
             with open(dest, "wb") as fh:
@@ -281,7 +284,7 @@ def download_text(url: str, timeout: int = 30) -> str | None:
     """Download a small text file and return its content, or None on error."""
     try:
         req = urllib.request.Request(url, headers={
-            "User-Agent": "IT-Aman-Daemon/3.4",
+            "User-Agent": _USER_AGENT,
         })
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read().decode("utf-8", errors="replace").strip()
@@ -373,7 +376,7 @@ def http_probe_model(ip: str) -> str | None:
     for url in urls_to_try:
         try:
             req = urllib.request.Request(url, headers={
-                "User-Agent": "IT-Aman-Daemon/3.4",
+                "User-Agent": _USER_AGENT,
             })
             with urllib.request.urlopen(req, timeout=MODEL_PROBE_TIMEOUT) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
@@ -499,6 +502,41 @@ def get_usb_uris() -> list[str]:
     return [b.split(":", 1)[1].strip() for b in backends if b.startswith("usb://")]
 
 
+def _get_printer_device_uri(name: str) -> str | None:
+    """Get the device URI for a given printer name via lpstat -v."""
+    rc, out, _ = run_cmd(["lpstat", "-v", name])
+    if rc == 0 and out:
+        # Format: "device for NAME: URI"
+        m = re.search(r'device\s+for\s+\S+:\s*(.+)', out)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def _get_printer_job_count(name: str) -> int:
+    """Get the number of queued jobs for a given printer via lpstat -o."""
+    rc, out, _ = run_cmd(["lpstat", "-o", name])
+    if rc != 0 or not out:
+        return 0
+    count = 0
+    for line in out.splitlines():
+        # Lines like: "NAME-123  user  size  date"
+        parts = line.strip().split()
+        if parts and parts[0].startswith(name):
+            count += 1
+    return count
+
+
+def _get_default_printer() -> str | None:
+    """Get the default printer name via lpstat -d."""
+    rc, out, _ = run_cmd(["lpstat", "-d"])
+    if rc == 0 and out:
+        m = re.search(r'system default destination:\s*(\S+)', out, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Kyocera driver auto-install
 # ---------------------------------------------------------------------------
@@ -561,8 +599,8 @@ def _set_thermal_cut_defaults(printer_name: str):
 
     # Also try to set DocumentCut and FullCut via lpoptions
     cut_opts = [
-        f"-o", "DocumentCut=PartialCut",
-        f"-o", "FullCut=PartialCut",
+        "-o", "DocumentCut=PartialCut",
+        "-o", "FullCut=PartialCut",
     ]
     rc2, _, err2 = run_cmd(["lpadmin", "-p", printer_name] + cut_opts)
     if rc2 != 0:
@@ -588,7 +626,12 @@ def handle_get_version(params: dict) -> dict:
 
 
 def handle_check_update(params: dict) -> dict:
-    """Check GitHub for the latest version and return it."""
+    """
+    Check GitHub for the latest version.
+    Returns both the remote version and whether an update is available
+    (compared to local VERSION), so the GUI can decide whether to show
+    a notification banner.
+    """
     version_url = f"{RAW_BASE}/version.json"
     version_text = download_text(version_url, timeout=15)
     if not version_text:
@@ -596,7 +639,13 @@ def handle_check_update(params: dict) -> dict:
     try:
         remote_info = json.loads(version_text)
         remote_version = remote_info.get("version", "")
-        return {"status": "ok", "version": remote_version}
+        update_available = _compare_versions(remote_version, VERSION) > 0
+        return {
+            "status": "ok",
+            "version": remote_version,
+            "local_version": VERSION,
+            "update_available": update_available,
+        }
     except json.JSONDecodeError:
         return {"status": "error", "message": "Invalid version info from server"}
 
@@ -630,7 +679,7 @@ def handle_fix(params: dict) -> dict:
     # 1. Check if CUPS is running
     if not cups_is_running():
         report["issues_found"] += 1
-        log.info("CUPS not running — attempting restart")
+        log.info("CUPS not running -- attempting restart")
         if cups_restart():
             report["actions"].append("CUPS was not running; restarted successfully")
         else:
@@ -897,7 +946,7 @@ def handle_network_scan(params: dict) -> dict:
     return {"status": "ok", "printers": printers}
 
 
-# ---- handle_setup_printer (IPP Everywhere → LPD → PPD → Kyocera) --------
+# ---- handle_setup_printer (IPP Everywhere -> LPD -> PPD -> Kyocera) --------
 
 def handle_setup_printer(params: dict) -> dict:
     """
@@ -940,7 +989,7 @@ def handle_setup_printer(params: dict) -> dict:
 
     # Remove existing printer with same name first
     if is_printer_exists(name):
-        log.info("Printer '%s' already exists — removing first", name)
+        log.info("Printer '%s' already exists -- removing first", name)
         run_cmd(["lpadmin", "-x", name])
 
     # --- Attempt 1: IPP Everywhere ---
@@ -1018,7 +1067,7 @@ def handle_setup_printer(params: dict) -> dict:
                     else:
                         setup_report["actions"].append("Kyocera driver installation failed")
 
-        # Final check — if still not created, try with raw driver
+        # Final check -- if still not created, try with raw driver
         if not is_printer_exists(name):
             log.info("Final attempt: raw driver for %s", name)
             use_uri = ipp_uri or lpd_uri
@@ -1114,7 +1163,7 @@ def _install_xprinter() -> dict:
         # Find USB URIs
         usb_uris = get_usb_uris()
         if not usb_uris:
-            report["actions"].append("No USB printer found — will retry on plug-in")
+            report["actions"].append("No USB printer found -- will retry on plug-in")
             usb_uri = "usb://XPrinter/XP-80"  # Placeholder
         else:
             # Pick the first USB URI (most likely the XP-80)
@@ -1189,7 +1238,7 @@ def _install_sprt() -> dict:
                 zf.extractall(extract_dir)
             report["actions"].append("Extracted SPRT driver archive")
         except zipfile.BadZipFile:
-            # The Dropbox download might not be a zip — try running it directly
+            # The Dropbox download might not be a zip -- try running it directly
             os.chmod(zip_path, 0o755)
             rc, out, err = run_cmd(["bash", zip_path], timeout=120)
             report["actions"].append(f"Ran downloaded file directly: rc={rc}")
@@ -1214,7 +1263,7 @@ def _install_sprt() -> dict:
                 report["actions"].append(f"install.sh returned {rc}: {err}")
                 log.warning("install.sh exit code %d: %s", rc, err)
         else:
-            report["actions"].append("No install.sh found — continuing manually")
+            report["actions"].append("No install.sh found -- continuing manually")
             log.warning("No install.sh found in SPRT driver archive")
 
         # Copy rastertoprinter filter if present
@@ -1296,7 +1345,7 @@ def _install_sprt() -> dict:
         # Find USB URI
         usb_uris = get_usb_uris()
         if not usb_uris:
-            report["actions"].append("No USB printer found — will retry on plug-in")
+            report["actions"].append("No USB printer found -- will retry on plug-in")
             usb_uri = "usb://SPRT/Printer"
         else:
             usb_uri = usb_uris[0]
@@ -1351,8 +1400,11 @@ def handle_remove_printer(params: dict) -> dict:
     """
     Remove a printer from CUPS:
       1. Cancel all its jobs
-      2. Disable it
-      3. Delete it with lpadmin -x
+      2. Delete it with lpadmin -x
+
+    Note: We do NOT cupsdisable before removal, because if lpadmin -x
+    fails, the printer would be left in a disabled state.  Cancelling
+    jobs and removing directly is safer.
     """
     name = params.get("name", "").strip()
     if not name:
@@ -1367,14 +1419,7 @@ def handle_remove_printer(params: dict) -> dict:
     else:
         actions.append(f"No jobs to cancel (or cancel failed): {err}")
 
-    # Disable printer
-    rc, _, err = run_cmd(["cupsdisable", name])
-    if rc == 0:
-        actions.append(f"Disabled printer '{name}'")
-    else:
-        actions.append(f"Disable failed (non-fatal): {err}")
-
-    # Remove printer
+    # Remove printer directly (no cupsdisable first)
     rc, _, err = run_cmd(["lpadmin", "-x", name])
     if rc == 0:
         actions.append(f"Removed printer '{name}' successfully")
@@ -1389,42 +1434,65 @@ def handle_remove_printer(params: dict) -> dict:
 
 def handle_quick_fix_spooler(params: dict) -> dict:
     """
-    Quick fix for a stuck spooler:
-      1. Stop CUPS
-      2. Clear /var/spool/cups/*
-      3. Start CUPS
+    Quick fix for a stuck spooler.
+    Safer approach:
+      1. Restart CUPS (not stop -- so it stays running even if cleanup fails)
+      2. Cancel all stuck jobs via cancel -a
+      3. Ensure CUPS is running
+      4. Only clear the spool directory as a last resort if the above
+         didn't resolve the issue
     """
     actions = []
 
-    # Stop CUPS
-    if cups_stop():
-        actions.append("CUPS stopped")
+    # Step 1: Restart CUPS (safer than stopping -- keeps it running)
+    log.info("Quick fix: restarting CUPS")
+    if cups_restart():
+        actions.append("CUPS restarted")
     else:
-        return {"status": "error", "message": "Failed to stop CUPS", "actions": actions}
+        actions.append("CUPS restart failed -- will try to continue")
 
-    # Clear spool directory
-    spool_dir = "/var/spool/cups"
-    try:
-        for entry in os.listdir(spool_dir):
-            path = os.path.join(spool_dir, entry)
+    # Step 2: Cancel all stuck jobs
+    rc, out, _ = run_cmd(["cancel", "-a"])
+    if rc == 0:
+        actions.append("Cancelled all stuck print jobs")
+    else:
+        actions.append("No stuck jobs to cancel (or cancel failed)")
+
+    # Step 3: Ensure CUPS is running
+    if not cups_is_running():
+        log.warning("CUPS not running after restart -- attempting start")
+        if cups_start():
+            actions.append("CUPS started")
+        else:
+            # CUPS won't start -- last resort: clear spool and try again
+            actions.append("CUPS failed to start -- clearing spool as last resort")
+
+            spool_dir = "/var/spool/cups"
             try:
-                if os.path.isfile(path) or os.path.islink(path):
-                    os.remove(path)
-                elif os.path.isdir(path):
-                    shutil.rmtree(path)
+                for entry in os.listdir(spool_dir):
+                    path = os.path.join(spool_dir, entry)
+                    try:
+                        if os.path.isfile(path) or os.path.islink(path):
+                            os.remove(path)
+                        elif os.path.isdir(path):
+                            shutil.rmtree(path)
+                    except Exception as exc:
+                        log.warning("Could not remove %s: %s", path, exc)
+                actions.append(f"Cleared spool directory: {spool_dir}")
+            except FileNotFoundError:
+                actions.append(f"Spool directory {spool_dir} does not exist (ok)")
             except Exception as exc:
-                log.warning("Could not remove %s: %s", path, exc)
-        actions.append(f"Cleared spool directory: {spool_dir}")
-    except FileNotFoundError:
-        actions.append(f"Spool directory {spool_dir} does not exist (ok)")
-    except Exception as exc:
-        actions.append(f"Error clearing spool: {exc}")
+                actions.append(f"Error clearing spool: {exc}")
 
-    # Start CUPS
-    if cups_start():
-        actions.append("CUPS started")
-    else:
-        return {"status": "error", "message": "Failed to start CUPS after clearing spool", "actions": actions}
+            # Try to start CUPS again after clearing spool
+            if cups_start():
+                actions.append("CUPS started after spool clear")
+            else:
+                return {
+                    "status": "error",
+                    "message": "Failed to start CUPS even after clearing spool",
+                    "actions": actions,
+                }
 
     log.info("Quick fix spooler complete")
     return {"status": "ok", "actions": actions}
@@ -1435,12 +1503,18 @@ def handle_quick_fix_spooler(params: dict) -> dict:
 def handle_detect_usb_printers(params: dict) -> dict:
     """
     Detect USB printers connected to the system.
-    Uses lpinfo -v for URIs and lsusb for descriptions.
-    Returns list of {uri, description, type}.
+    Uses multiple detection methods for thoroughness:
+      1. lpinfo -v for USB URIs (CUPS-known devices)
+      2. lsusb for USB device descriptions (recently plugged devices)
+      3. /dev/usb/lp* device nodes (kernel-level USB printer devices)
+      4. udevadm info for usb_printer_id on each /dev/usb/lp* device
+
+    Returns list of {uri, full_uri, description, type, device, bus_info}.
     """
     printers = []
+    seen_uris = set()
 
-    # Get USB URIs from lpinfo
+    # --- Method 1: lpinfo -v for USB URIs ---
     backends = get_cups_backends()
     usb_entries = [b for b in backends if b.startswith("usb://")]
 
@@ -1452,17 +1526,19 @@ def handle_detect_usb_printers(params: dict) -> dict:
         # Parse USB URI: usb://Vendor/Model?serial=XXX
         uri = entry.split(":", 1)[1].strip() if ":" in entry else entry
 
+        # Avoid duplicates
+        if uri in seen_uris:
+            continue
+        seen_uris.add(uri)
+
         # Try to match with lsusb description
         description = "USB Printer"
-        # Extract vendor from URI
         uri_lower = uri.lower()
-        for line in lsusb_lines:
-            line_lower = line.lower()
-            # Check if any part of the URI appears in lsusb line
-            # USB URIs often have the vendor name
-            vendor_match = re.search(r'usb://([^/?]+)', uri)
-            if vendor_match:
-                vendor = vendor_match.group(1).lower()
+        vendor_match = re.search(r'usb://([^/?]+)', uri)
+        if vendor_match:
+            vendor = vendor_match.group(1).lower()
+            for line in lsusb_lines:
+                line_lower = line.lower()
                 if vendor in line_lower:
                     description = line.strip()
                     break
@@ -1472,37 +1548,340 @@ def handle_detect_usb_printers(params: dict) -> dict:
             "full_uri": entry,
             "description": description,
             "type": "usb",
+            "device": None,
+            "source": "lpinfo",
         })
+
+    # --- Method 2: lsusb parsing for printer-class devices ---
+    # USB printer class is 07 (USB_CLASS_PRINTER)
+    rc, lsusb_v_out, _ = run_cmd(
+        ["lsusb", "-v", "-d", ":0701,"],
+        timeout=10,
+    )
+    if rc == 0 and lsusb_v_out:
+        # Parse verbose lsusb for printer devices
+        current_device = {}
+        for line in lsusb_v_out.splitlines():
+            # New device header: "Bus 001 Device 005: ID 0416:5011 ..."
+            m = re.search(r'Bus\s+(\d+)\s+Device\s+(\d+):\s+ID\s+([0-9a-fA-F]{4}):([0-9a-fA-F]{4})\s+(.*)', line)
+            if m:
+                if current_device.get("bus"):
+                    # Store previous device if it had printer info
+                    _add_lsusb_printer(current_device, printers, seen_uris, lsusb_lines)
+                current_device = {
+                    "bus": m.group(1),
+                    "dev": m.group(2),
+                    "vid": m.group(3),
+                    "pid": m.group(4),
+                    "desc": m.group(5).strip(),
+                }
+            # Look for iProduct or iManufacturer
+            if current_device.get("bus"):
+                m_prod = re.search(r'iProduct\s+\d+\s+(.*)', line)
+                if m_prod:
+                    current_device["product"] = m_prod.group(1).strip()
+                m_mfg = re.search(r'iManufacturer\s+\d+\s+(.*)', line)
+                if m_mfg:
+                    current_device["manufacturer"] = m_mfg.group(1).strip()
+                m_serial = re.search(r'iSerial\s+\d+\s+(.*)', line)
+                if m_serial:
+                    current_device["serial"] = m_serial.group(1).strip()
+
+        # Don't forget the last device
+        if current_device.get("bus"):
+            _add_lsusb_printer(current_device, printers, seen_uris, lsusb_lines)
+
+    # --- Method 3: /dev/usb/lp* device nodes ---
+    lp_glob = "/dev/usb/lp*"
+    import glob as _glob
+    lp_devices = _glob.glob(lp_glob)
+
+    for lp_dev in lp_devices:
+        # Check if this device is already covered by a known URI
+        # /dev/usb/lp0 typically maps to usb://Vendor/Model?serial=...
+        description = f"USB printer device ({lp_dev})"
+        bus_info = None
+
+        # Try to get usb_printer_id via udevadm
+        rc_udev, udev_out, _ = run_cmd(
+            ["udevadm", "info", "--query=property", "--name", lp_dev],
+            timeout=5,
+        )
+        vendor_name = None
+        model_name = None
+        serial = None
+        usb_vid = None
+        usb_pid = None
+
+        if rc_udev == 0 and udev_out:
+            for prop_line in udev_out.splitlines():
+                if "=" in prop_line:
+                    key, _, val = prop_line.partition("=")
+                    if key == "ID_VENDOR_FROM_DATABASE":
+                        vendor_name = val.strip()
+                    elif key == "ID_MODEL_FROM_DATABASE":
+                        model_name = val.strip()
+                    elif key == "ID_SERIAL_SHORT":
+                        serial = val.strip()
+                    elif key == "ID_VENDOR_ID":
+                        usb_vid = val.strip()
+                    elif key == "ID_MODEL_ID":
+                        usb_pid = val.strip()
+                    elif key == "ID_BUS":
+                        bus_info = val.strip()
+
+        # Try usb_printer_id for IEEE 1284 device ID
+        rc_pid, pid_out, _ = run_cmd(
+            ["usb_printerid", lp_dev],
+            timeout=5,
+        )
+        ieee_mfg = None
+        ieee_mdl = None
+        ieee_serial = None
+        if rc_pid == 0 and pid_out:
+            m_mfg = re.search(r'MFG:([^;]+)', pid_out)
+            if m_mfg:
+                ieee_mfg = m_mfg.group(1).strip()
+            m_mdl = re.search(r'MDL:([^;]+)', pid_out)
+            if m_mdl:
+                ieee_mdl = m_mdl.group(1).strip()
+            m_srl = re.search(r'SERN:([^;]+)', pid_out)
+            if m_srl:
+                ieee_serial = m_srl.group(1).strip()
+
+        # Build a USB URI from collected info
+        mfg = ieee_mfg or vendor_name or "Unknown"
+        mdl = ieee_mdl or model_name or "Printer"
+        ser = ieee_serial or serial or ""
+
+        # Construct CUPS-style USB URI
+        usb_uri = f"usb://{mfg}/{mdl}"
+        if ser:
+            usb_uri += f"?serial={ser}"
+
+        # Check if already known
+        if usb_uri in seen_uris:
+            continue
+        seen_uris.add(usb_uri)
+
+        # Build description
+        if vendor_name and model_name:
+            description = f"{vendor_name} {model_name}"
+        elif ieee_mfg and ieee_mdl:
+            description = f"{ieee_mfg} {ieee_mdl}"
+        else:
+            # Try to match lsusb line
+            if usb_vid and usb_pid:
+                for line in lsusb_lines:
+                    if usb_vid in line.lower() and usb_pid in line.lower():
+                        description = line.strip()
+                        break
+
+        printers.append({
+            "uri": usb_uri,
+            "full_uri": f"usb://{mfg}/{mdl}" + (f"?serial={ser}" if ser else ""),
+            "description": description,
+            "type": "usb",
+            "device": lp_dev,
+            "source": "dev-node",
+            "bus_info": bus_info,
+        })
+
+    # --- Method 4: Thorough scan of usb:// URIs from lpinfo ---
+    # Re-check lpinfo in case new devices appeared
+    rc2, lpinfo_out2, _ = run_cmd(["lpinfo", "-v", "--timeout", "5"])
+    if rc2 == 0 and lpinfo_out2:
+        for line in lpinfo_out2.splitlines():
+            line = line.strip()
+            if line.startswith("usb://"):
+                uri = line.split(":", 1)[1].strip() if ":" in line else line
+                if uri not in seen_uris:
+                    seen_uris.add(uri)
+                    description = "USB Printer"
+                    # Try lsusb match
+                    vendor_match = re.search(r'usb://([^/?]+)', uri)
+                    if vendor_match:
+                        vendor = vendor_match.group(1).lower()
+                        for ls_line in lsusb_lines:
+                            if vendor in ls_line.lower():
+                                description = ls_line.strip()
+                                break
+                    printers.append({
+                        "uri": uri,
+                        "full_uri": line,
+                        "description": description,
+                        "type": "usb",
+                        "device": None,
+                        "source": "lpinfo-refresh",
+                    })
 
     log.info("Detected %d USB printers", len(printers))
     return {"status": "ok", "printers": printers}
 
 
-# ---- handle_discover_printers (combo of USB + network) --------------------
+def _add_lsusb_printer(device_info: dict, printers: list, seen_uris: set,
+                        lsusb_lines: list):
+    """
+    Helper for handle_detect_usb_printers: add a printer found via lsusb -v
+    to the printers list if its URI is not already known.
+    """
+    vid = device_info.get("vid", "")
+    pid = device_info.get("pid", "")
+    mfg = device_info.get("manufacturer", "")
+    mdl = device_info.get("product", "")
+    serial = device_info.get("serial", "")
+
+    if not mfg:
+        mfg = "Unknown"
+    if not mdl:
+        mdl = "Printer"
+
+    # Build a CUPS-style USB URI
+    usb_uri = f"usb://{mfg}/{mdl}"
+    if serial:
+        usb_uri += f"?serial={serial}"
+
+    if usb_uri in seen_uris:
+        return
+    seen_uris.add(usb_uri)
+
+    # Build description from lsusb short listing
+    description = device_info.get("desc", "")
+    if not description and vid and pid:
+        for line in lsusb_lines:
+            if vid in line and pid in line:
+                description = line.strip()
+                break
+    if not description:
+        description = f"{mfg} {mdl}"
+
+    printers.append({
+        "uri": usb_uri,
+        "full_uri": usb_uri,
+        "description": description,
+        "type": "usb",
+        "device": None,
+        "source": "lsusb",
+        "bus_info": f"Bus {device_info.get('bus', '?')} Device {device_info.get('dev', '?')}",
+    })
+
+
+# ---- handle_discover_printers (all installed printers with consistent format) ----
 
 def handle_discover_printers(params: dict) -> dict:
     """
-    Discover all printers: USB + network via CUPS backends and mDNS.
-    Combines detect_usb_printers and scan for a full picture.
+    Discover all installed printers using lpstat -p.
+    Returns a consistent data format where each printer entry has:
+      - name (string): the CUPS printer queue name
+      - state (string): "enabled" or "disabled"
+      - device (string): the device URI
+      - jobs (int): number of queued jobs
+
+    Also includes USB printers detected via detect_usb_printers for
+    devices that may not yet be installed in CUPS.
     """
-    usb_result = handle_detect_usb_printers(params)
-    scan_result = handle_scan(params)
-
     printers = []
+    seen_names = set()
 
-    # Add USB printers
+    # --- Primary source: lpstat -p for all installed printers ---
+    rc, out, _ = run_cmd(["lpstat", "-p"])
+    if rc == 0 and out:
+        for line in out.splitlines():
+            # Format: "printer NAME enabled since ..." or "printer NAME disabled since ..."
+            m = re.match(r'printer\s+(\S+)\s+(enabled|disabled)', line, re.IGNORECASE)
+            if m:
+                name = m.group(1)
+                state = m.group(2).lower()
+                seen_names.add(name)
+
+                device_uri = _get_printer_device_uri(name) or ""
+                job_count = _get_printer_job_count(name)
+
+                printers.append({
+                    "name": name,
+                    "state": state,
+                    "device": device_uri,
+                    "jobs": job_count,
+                })
+
+    # --- Supplement: also detect USB printers not yet installed ---
+    usb_result = handle_detect_usb_printers(params)
     if usb_result.get("status") == "ok":
-        printers.extend(usb_result.get("printers", []))
+        for usb_printer in usb_result.get("printers", []):
+            uri = usb_printer.get("uri", "")
+            # Only add if this USB device is NOT already in the installed list
+            already_known = any(
+                p.get("device", "").startswith("usb://") and uri in p.get("device", "")
+                for p in printers
+            )
+            if not already_known and uri:
+                printers.append({
+                    "name": usb_printer.get("description", "Unknown USB Printer"),
+                    "state": "not-installed",
+                    "device": usb_printer.get("full_uri", f"usb://{uri}"),
+                    "jobs": 0,
+                })
 
-    # Add network printers (avoiding duplicates)
-    seen_uris = {p.get("uri") for p in printers}
+    # --- Supplement: network printers from quick scan ---
+    scan_result = handle_scan(params)
     if scan_result.get("status") == "ok":
-        for p in scan_result.get("printers", []):
-            if p.get("uri") not in seen_uris:
-                printers.append(p)
-                seen_uris.add(p.get("uri"))
+        for net_printer in scan_result.get("printers", []):
+            uri = net_printer.get("uri", "")
+            net_type = net_printer.get("type", "network")
+            if net_type == "network" and uri:
+                already_known = any(
+                    uri in p.get("device", "") for p in printers
+                )
+                if not already_known:
+                    printers.append({
+                        "name": net_printer.get("ip", uri),
+                        "state": "network",
+                        "device": net_printer.get("full_uri", uri),
+                        "jobs": 0,
+                    })
 
+    log.info("Discovered %d printers total", len(printers))
     return {"status": "ok", "printers": printers}
+
+
+# ---- handle_list_installed_printers (new handler for GUI) ------------------
+
+def handle_list_installed_printers(params: dict) -> dict:
+    """
+    List ALL installed printers with their status, device URI, and job count.
+    Uses lpstat -p -d for comprehensive info.
+    This is what the GUI needs for Repair, Status, and Remove screens.
+
+    Returns: {status: "ok", printers: [{name, state, device, jobs, is_default}, ...]}
+    """
+    printers = []
+    default_printer = _get_default_printer()
+
+    # Get all printers via lpstat -p
+    rc, out, _ = run_cmd(["lpstat", "-p"])
+    if rc != 0 or not out:
+        return {"status": "ok", "printers": [], "default": None}
+
+    for line in out.splitlines():
+        # Format: "printer NAME enabled since ..." or "printer NAME disabled since ..."
+        m = re.match(r'printer\s+(\S+)\s+(enabled|disabled)', line, re.IGNORECASE)
+        if m:
+            name = m.group(1)
+            state = m.group(2).lower()
+            device_uri = _get_printer_device_uri(name) or ""
+            job_count = _get_printer_job_count(name)
+            is_default = (name == default_printer)
+
+            printers.append({
+                "name": name,
+                "state": state,
+                "device": device_uri,
+                "jobs": job_count,
+                "is_default": is_default,
+            })
+
+    log.info("Listed %d installed printers (default: %s)", len(printers), default_printer)
+    return {"status": "ok", "printers": printers, "default": default_printer}
 
 
 # ---- handle_clear_jobs ----------------------------------------------------
@@ -1510,7 +1889,7 @@ def handle_discover_printers(params: dict) -> dict:
 def handle_clear_jobs(params: dict) -> dict:
     """
     Clear print jobs for a specific printer or all printers.
-    Params: name (optional) — if omitted, clears all jobs.
+    Params: name (optional) -- if omitted, clears all jobs.
     """
     name = params.get("name", "").strip()
 
@@ -1554,7 +1933,7 @@ def handle_test_print(params: dict) -> dict:
         test_page = os.path.join(tmp_dir, "test.txt")
         with open(test_page, "w") as fh:
             fh.write("=" * 60 + "\n")
-            fh.write("  IT Aman Printer Daemon — Test Page\n")
+            fh.write("  IT Aman Printer Daemon -- Test Page\n")
             fh.write(f"  Printer: {name}\n")
             fh.write(f"  Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             fh.write(f"  Version: {VERSION}\n")
@@ -1579,7 +1958,7 @@ def handle_test_print(params: dict) -> dict:
 def handle_update_all(params: dict) -> dict:
     """
     Check for and apply updates from the public GitHub repository.
-    NO token needed — repo is public, uses raw.githubusercontent.com URLs.
+    NO token needed -- repo is public, uses raw.githubusercontent.com URLs.
 
     Update process (with Ed25519 signature verification):
       1. Download version.json from raw.githubusercontent.com
@@ -1592,7 +1971,7 @@ def handle_update_all(params: dict) -> dict:
       2. Change VERSION in daemon.py
       3. Change version in version.json
       4. Run: python3 generate_manifest.py
-      5. git add -A && git commit -m "v3.5" && git push
+      5. git add -A && git commit -m "v3.8" && git push
     """
     report = {"status": "ok", "actions": []}
 
@@ -1638,7 +2017,7 @@ def handle_update_all(params: dict) -> dict:
     files_list = manifest.get("files", [])
 
     if not signature_b64 or not public_key_b64:
-        return {"status": "error", "message": "Update manifest missing signature or public_key — update rejected for security"}
+        return {"status": "error", "message": "Update manifest missing signature or public_key -- update rejected for security"}
 
     if not files_list:
         return {"status": "error", "message": "Update manifest has no files to update"}
@@ -1648,8 +2027,8 @@ def handle_update_all(params: dict) -> dict:
             public_key_b64, signature_b64, files_list
         )
         if not sig_valid:
-            return {"status": "error", "message": "Ed25519 signature verification FAILED — update rejected"}
-        report["actions"].append("Ed25519 signature verified ✓")
+            return {"status": "error", "message": "Ed25519 signature verification FAILED -- update rejected"}
+        report["actions"].append("Ed25519 signature verified")
     except Exception as exc:
         return {"status": "error", "message": f"Signature verification error: {exc}"}
 
@@ -1694,7 +2073,7 @@ def handle_update_all(params: dict) -> dict:
                     remote_path, expected_sha256, actual_sha256,
                 )
                 os.remove(tmp_dest)
-                report["actions"].append(f"SHA256 mismatch for {remote_path} — skipped")
+                report["actions"].append(f"SHA256 mismatch for {remote_path} -- skipped")
                 continue
 
         # Replace the file
@@ -1791,7 +2170,7 @@ def _verify_ed25519_signature(public_key_b64: str, signature_b64: str, files_lis
         import nacl.encoding
     except ImportError:
         log.warning(
-            "PyNaCl not installed — attempting Ed25519 verification with openssl"
+            "PyNaCl not installed -- attempting Ed25519 verification with openssl"
         )
         return _verify_ed25519_openssl(public_key_b64, signature_b64, files_list)
 
@@ -1897,6 +2276,7 @@ HANDLERS = {
     "install_thermal_brand": handle_install_thermal_brand,
     "detect_usb_printers": handle_detect_usb_printers,
     "discover_printers": handle_discover_printers,
+    "list_installed_printers": handle_list_installed_printers,
     "clear_jobs": handle_clear_jobs,
     "test_print": handle_test_print,
     "update_all": handle_update_all,
@@ -1904,7 +2284,7 @@ HANDLERS = {
 }
 
 
-# Action name aliases — GUI sends "action", daemon expects "command"
+# Action name aliases -- GUI sends "action", daemon expects "command"
 ACTION_ALIASES = {
     "diagnose": "fix",
     "scan_network": "network_scan",
@@ -2061,7 +2441,7 @@ def run_socket_server():
                     continue
                 raise
     except KeyboardInterrupt:
-        log.info("Received KeyboardInterrupt — shutting down")
+        log.info("Received KeyboardInterrupt -- shutting down")
     finally:
         server.close()
         if os.path.exists(SOCKET_PATH):
@@ -2078,7 +2458,7 @@ def run_socket_server():
 def _signal_handler(signum, frame):
     """Handle termination signals gracefully."""
     sig_name = signal.Signals(signum).name
-    log.info("Received signal %s — shutting down", sig_name)
+    log.info("Received signal %s -- shutting down", sig_name)
 
     # Clean up socket
     if os.path.exists(SOCKET_PATH):
@@ -2154,7 +2534,7 @@ def preflight_checks():
     # Ensure CUPS is installed
     rc, _, _ = run_cmd(["which", "cupsd"])
     if rc != 0:
-        log.warning("cupsd not found — CUPS may not be installed")
+        log.warning("cupsd not found -- CUPS may not be installed")
 
     # Create necessary directories
     for path in [CONFIG_DIR, LOG_DIR, os.path.dirname(SOCKET_PATH)]:
@@ -2188,7 +2568,7 @@ def _auto_update_loop():
     The check interval is controlled by AUTO_UPDATE_INTERVAL (default 60s).
     Set AUTO_UPDATE_ENABLED = False to disable.
     """
-    log.info("Auto-update check loop started — checking every %d seconds", AUTO_UPDATE_INTERVAL)
+    log.info("Auto-update check loop started -- checking every %d seconds", AUTO_UPDATE_INTERVAL)
 
     # Wait a bit on first start so the daemon settles before checking
     _auto_update_stop.wait(30)
@@ -2233,7 +2613,7 @@ def main():
     """Main entry point for the IT Aman Printer Daemon."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="IT Aman Printer Daemon v3.4")
+    parser = argparse.ArgumentParser(description=f"IT Aman Printer Daemon v{VERSION}")
     parser.add_argument(
         "--foreground", "-f",
         action="store_true",
@@ -2259,7 +2639,7 @@ def main():
     # Daemonize unless foreground mode
     if not args.foreground:
         daemonize()
-        log.info("Daemonized — PID %d", os.getpid())
+        log.info("Daemonized -- PID %d", os.getpid())
 
     # If verbose, increase console log level
     if args.verbose:
