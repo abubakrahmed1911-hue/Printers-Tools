@@ -111,6 +111,27 @@ ALLOWED_COMMANDS = {
     "get_version",
     "get_config",
     "set_language",
+    # GUI action aliases (also accepted)
+    "diagnose",
+    "scan_network",
+    "add_network_printer",
+    "install_thermal_driver",
+    "fix_spooler",
+    "detect_usb_printer",
+    "list_printers",
+    "repair_printer",
+    "update",
+    "check_update",
+    # GUI action aliases (also accepted)
+    "diagnose",
+    "scan_network",
+    "add_network_printer",
+    "install_thermal_driver",
+    "fix_spooler",
+    "detect_usb_printer",
+    "list_printers",
+    "repair_printer",
+    "update",
 }
 
 # ---------------------------------------------------------------------------
@@ -560,6 +581,20 @@ def handle_ping(params: dict) -> dict:
 def handle_get_version(params: dict) -> dict:
     """Return the daemon version."""
     return {"status": "ok", "version": VERSION}
+
+
+def handle_check_update(params: dict) -> dict:
+    """Check GitHub for the latest version and return it."""
+    version_url = f"{RAW_BASE}/version.json"
+    version_text = download_text(version_url, timeout=15)
+    if not version_text:
+        return {"status": "error", "message": "Cannot reach update server"}
+    try:
+        remote_info = json.loads(version_text)
+        remote_version = remote_info.get("version", "")
+        return {"status": "ok", "version": remote_version}
+    except json.JSONDecodeError:
+        return {"status": "error", "message": "Invalid version info from server"}
 
 
 def handle_get_config(params: dict) -> dict:
@@ -1855,15 +1890,35 @@ HANDLERS = {
     "clear_jobs": handle_clear_jobs,
     "test_print": handle_test_print,
     "update_all": handle_update_all,
+    "check_update": handle_check_update,
+}
+
+
+# Action name aliases — GUI sends "action", daemon expects "command"
+ACTION_ALIASES = {
+    "diagnose": "fix",
+    "scan_network": "network_scan",
+    "add_network_printer": "setup_printer",
+    "install_thermal_driver": "install_thermal_brand",
+    "fix_spooler": "quick_fix_spooler",
+    "detect_usb_printer": "detect_usb_printers",
+    "list_printers": "discover_printers",
+    "repair_printer": "fix",
+    "update": "update_all",
 }
 
 
 def process_command(data: dict) -> dict:
     """
     Process a single JSON command from the GUI.
+    Accepts both "action" and "command" keys.
     Validates the command against ALLOWED_COMMANDS and dispatches to handler.
     """
-    command = data.get("command", "")
+    # Accept both "action" (from GUI) and "command" (internal)
+    command = data.get("action", "") or data.get("command", "")
+
+    # Apply aliases so GUI action names map to daemon commands
+    command = ACTION_ALIASES.get(command, command)
 
     if not command:
         return {"status": "error", "message": "No command specified"}
@@ -1896,43 +1951,28 @@ def process_command(data: dict) -> dict:
 
 def recv_message(conn: socket.socket) -> bytes | None:
     """
-    Receive a length-prefixed message from the socket.
-    Protocol: 4-byte little-endian length prefix, then payload.
+    Receive a newline-delimited JSON message from the socket.
+    Protocol: read until newline (\n), then return the payload without it.
     Returns None on connection close or error.
     """
-    # Read the 4-byte length prefix
-    raw_len = b""
-    while len(raw_len) < 4:
-        chunk = conn.recv(4 - len(raw_len))
-        if not chunk:
-            return None
-        raw_len += chunk
-
-    msg_len = struct.unpack("<I", raw_len)[0]
-    if msg_len == 0:
-        return b""
-    if msg_len > 10_000_000:  # Safety limit: 10 MB
-        log.error("Message too large: %d bytes", msg_len)
-        return None
-
-    # Read the payload
     data = b""
-    while len(data) < msg_len:
-        chunk = conn.recv(min(msg_len - len(data), SOCKET_RECV_BUF))
+    while True:
+        chunk = conn.recv(4096)
         if not chunk:
-            return None
+            return None if not data else data
         data += chunk
-
-    return data
+        if b"\n" in data:
+            # Return everything up to the first newline
+            line, _ = data.split(b"\n", 1)
+            return line
 
 
 def send_message(conn: socket.socket, data: bytes):
     """
-    Send a length-prefixed message to the socket.
-    Protocol: 4-byte little-endian length prefix, then payload.
+    Send a newline-delimited message to the socket.
+    Protocol: payload + newline (\n).
     """
-    length = struct.pack("<I", len(data))
-    conn.sendall(length + data)
+    conn.sendall(data + b"\n")
 
 
 def handle_client(conn: socket.socket, addr):
