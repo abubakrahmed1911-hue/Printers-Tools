@@ -1,31 +1,26 @@
 {
-  "version": "3.12",
   "files": [
     {
       "path": "src/daemon.py",
-      "sha256": "b41ec4d13d32272697c4d49bf85491108c68226a6a2489d6f0bd90e4a17f05a5"
+      "sha256": "582ecd52a6b29fce98e53576fa96df804acb5a2482600dcd1b7d6204c98a8834"
     },
     {
       "path": "src/gui.py",
-      "sha256": "6cdac701a4ebd017fe88f4bd2a5251bb5f25e716a1a515853dcc97475b7fe752"
-    },
-    {
-      "path": "install.sh",
-      "sha256": "b2b30557e1b2937674abec9402990205c7036730e6f81425baa47f338fe54df3"
+      "sha256": "7abcef435ee3fdd652bf35a12d12a8ba6f68589eae17abcfc0be1b215c371f47"
     },
     {
       "path": "version.json",
-      "sha256": "6e2e4e203591c7082b3186de67572065dc21300152a46e1c4b46eb16a5fa9d0e"
+      "sha256": "b2abdc94fdc21c39bdbbf1eefbbbfdeec656665e94d63b6443581020282b7b7f"
     },
     {
       "path": "public.pem",
       "sha256": "110623df94b4006c5115fde530c65ccc2839d8099b40a0cde3806d921a205063"
     },
     {
-      "path": "printer_definitions.json",
-      "sha256": "940459b734895da989100cfe392589b501730a8f2da099a0206db4581feac15f"
+      "path": ".gitignore",
+      "sha256": "458ce643832e42c98c00d251f12eee048e6a58e057cc35ffa957b6c29a23f6dd"
     }
   ],
-  "signature": "",
-  "public_key": ""
+  "signature": "bxXt9oEjc++q+6BlBJcldYHYoW1UfAhsk/2X1IwCziRu4hbm4DlftuMIA58gwmzIvLeqMUI2L4oxFtSt/lGyBg==",
+  "public_key": "qJBlIXftA+JpNKe85xpAFmbxMsR3w1KLMDEjSTTBN3s="
 }
