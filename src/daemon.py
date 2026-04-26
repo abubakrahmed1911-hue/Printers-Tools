@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 """
-IT Aman Printer Daemon v3.10
+IT Aman Printer Daemon v3.11
 =============================
 A Unix socket daemon for managing CUPS printers on Linux.
 Runs as root, listens on /run/it-aman/it-aman.sock, and processes
 JSON commands from the GTK3 GUI client.
 Developed by IT Helpdesk Operation.
 
-Key changes from v3.9:
-  - CRITICAL FIX: process_command now merges top-level JSON keys into
-    params dict. Previously, GUI sent params like {"action": "repair_printer",
-    "name": "HP"} but handlers expected data["params"]["name"]. This caused
-    ALL parameterized commands (repair, remove, setup, thermal) to fail.
-  - Fixed handle_detect_usb_printers: returns error status when no USB
-    printers found, so thermal wizard correctly shows "not detected"
-  - Added CUPS safety check after every CUPS-modifying command to ensure
-    CUPS stays running and is never accidentally left in stopped state
-  - VERSION bumped to 3.10
+Key changes from v3.10:
+  - CRITICAL FIX: pulse_loop timer leak causing GUI freeze — now returns True
+    for GLib auto-repeat instead of creating new timers each cycle
+  - CRITICAL FIX: Network printer setup now works when only URI is provided
+    (no IP), extracting IP from URI for LPD fallback
+  - CRITICAL FIX: Thermal driver install now receives USB URI from wizard
+    detection, ensuring correct printer is configured
+  - FIX: Spooler clear now only removes temp/control files (c*) not data
+    files (d*), preventing accidental job data loss
+  - FIX: CUPS start retries 3 times before resorting to spool cleanup
+  - FIX: Network printer card passes full_uri and uri for better setup
+  - VERSION bumped to 3.11
 
 Architecture:
   - Unix socket at /run/it-aman/it-aman.sock
@@ -52,7 +54,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "3.10"
+VERSION = "3.11"
 
 # Paths
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
@@ -972,13 +974,21 @@ def handle_setup_printer(params: dict) -> dict:
         log.info("Sanitized printer name: '%s' -> '%s'", name, safe_name)
         name = safe_name
 
-    # Build URIs
-    ipp_uri = f"ipp://{ip}:631/ipp/print" if ip else uri
-    lpd_uri = f"lpd://{ip}/queue" if ip else None
-
-    # If user provided a custom URI, use that
-    if uri and not ip:
+    # Build URIs — handle both ip-only and uri-only cases
+    if ip:
+        ipp_uri = f"ipp://{ip}:631/ipp/print"
+        lpd_uri = f"lpd://{ip}/queue"
+    elif uri:
+        # Use the provided URI directly for IPP attempt
         ipp_uri = uri
+        lpd_uri = None
+        # Try to extract IP from URI for LPD fallback
+        ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', uri)
+        if ip_match:
+            extracted_ip = ip_match.group(1)
+            lpd_uri = f"lpd://{extracted_ip}/queue"
+    else:
+        ipp_uri = ""
         lpd_uri = None
 
     setup_report = {"status": "ok", "actions": [], "printer": name}
@@ -990,10 +1000,15 @@ def handle_setup_printer(params: dict) -> dict:
 
     # --- Attempt 1: IPP Everywhere ---
     log.info("Attempt 1: IPP Everywhere for %s at %s", name, ipp_uri)
-    rc, out, err = run_cmd(
-        ["lpadmin", "-p", name, "-E", "-v", ipp_uri, "-m", "everywhere"],
-        timeout=30,
-    )
+    if not ipp_uri:
+        log.warning("No URI available for IPP Everywhere setup")
+        rc = -1
+        err = "No URI provided"
+    else:
+        rc, out, err = run_cmd(
+            ["lpadmin", "-p", name, "-E", "-v", ipp_uri, "-m", "everywhere"],
+            timeout=30,
+        )
     if rc == 0:
         setup_report["actions"].append(f"Set up via IPP Everywhere: {ipp_uri}")
         log.info("IPP Everywhere setup succeeded for %s", name)
@@ -1122,15 +1137,21 @@ def handle_install_thermal_brand(params: dict) -> dict:
             "message": f"Unsupported brand '{brand}'. Use 'xprinter' or 'sprt'.",
         }
 
+    # Pass the full params dict to the installers so they can access usb_uri etc.
     if brand == "xprinter":
-        return _install_xprinter()
+        return _install_xprinter(params)
     else:
-        return _install_sprt()
+        return _install_sprt(params)
 
 
-def _install_xprinter() -> dict:
+def _install_xprinter(params=None) -> dict:
     """Install XPrinter XP-80 driver and set up the printer."""
+    if params is None:
+        params = {}
     report = {"status": "ok", "actions": [], "brand": "xprinter"}
+
+    # Check if there's a specific USB URI from the thermal wizard detection
+    requested_usb_uri = params.get("usb_uri", "").strip()
 
     # Remove existing printer first
     if is_printer_exists(XPRINTER_PRINTER_NAME):
@@ -1156,15 +1177,18 @@ def _install_xprinter() -> dict:
         # Restart CUPS to pick up new PPDs/filters
         cups_restart()
 
-        # Find USB URIs
+        # Find USB URIs — prefer the one from wizard detection
         usb_uris = get_usb_uris()
-        if not usb_uris:
-            report["actions"].append("No USB printer found -- will retry on plug-in")
-            usb_uri = "usb://XPrinter/XP-80"  # Placeholder
-        else:
+        if requested_usb_uri and requested_usb_uri in usb_uris:
+            usb_uri = requested_usb_uri
+            report["actions"].append(f"Using detected USB URI: {usb_uri}")
+        elif usb_uris:
             # Pick the first USB URI (most likely the XP-80)
             usb_uri = usb_uris[0]
             report["actions"].append(f"Found USB URI: {usb_uri}")
+        else:
+            report["actions"].append("No USB printer found -- will retry on plug-in")
+            usb_uri = "usb://XPrinter/XP-80"  # Placeholder
 
         # Find PPD via lpinfo
         ppd = find_ppd_for_model("XP-80")
@@ -1211,9 +1235,14 @@ def _install_xprinter() -> dict:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _install_sprt() -> dict:
+def _install_sprt(params=None) -> dict:
     """Install SPRT thermal printer driver and set up the printer."""
+    if params is None:
+        params = {}
     report = {"status": "ok", "actions": [], "brand": "sprt"}
+
+    # Check if there's a specific USB URI from the thermal wizard detection
+    requested_usb_uri = params.get("usb_uri", "").strip()
 
     # Remove existing printer first
     if is_printer_exists(SPRT_PRINTER_NAME):
@@ -1338,14 +1367,17 @@ def _install_sprt() -> dict:
         # Restart CUPS to pick up new PPDs/filters
         cups_restart()
 
-        # Find USB URI
+        # Find USB URI — prefer the one from wizard detection
         usb_uris = get_usb_uris()
-        if not usb_uris:
-            report["actions"].append("No USB printer found -- will retry on plug-in")
-            usb_uri = "usb://SPRT/Printer"
-        else:
+        if requested_usb_uri and requested_usb_uri in usb_uris:
+            usb_uri = requested_usb_uri
+            report["actions"].append(f"Using detected USB URI: {usb_uri}")
+        elif usb_uris:
             usb_uri = usb_uris[0]
             report["actions"].append(f"Found USB URI: {usb_uri}")
+        else:
+            report["actions"].append("No USB printer found -- will retry on plug-in")
+            usb_uri = "usb://SPRT/Printer"
 
         # Set up printer with -P flag (direct PPD path)
         if os.path.isfile(SPRT_PPD_DEST):
@@ -1625,32 +1657,43 @@ def handle_quick_fix_spooler(params: dict) -> dict:
     # Step 3: Ensure CUPS is running (but do NOT cancel all jobs)
     if not cups_is_running():
         log.warning("CUPS not running after restart -- attempting start")
-        if cups_start():
-            actions.append("CUPS started")
-        else:
-            # CUPS won't start -- last resort: clear only spool temp files, NOT active jobs
-            actions.append("CUPS failed to start -- cleaning spool temp files")
+        # Try starting CUPS multiple times before resorting to spool clear
+        started = False
+        for attempt in range(3):
+            log.info("CUPS start attempt %d/3", attempt + 1)
+            if cups_start():
+                started = True
+                actions.append("CUPS started")
+                break
+            time.sleep(2)
 
+        if not started:
+            # CUPS won't start -- last resort: clear ONLY temp files (cNNNNNN),
+            # NOT data files (dNNNNNN) which are active print jobs
+            actions.append("CUPS failed to start -- cleaning spool temp files")
             spool_dir = "/var/spool/cups"
             try:
+                cleared = 0
                 for entry in os.listdir(spool_dir):
-                    path = os.path.join(spool_dir, entry)
-                    try:
-                        if os.path.isfile(path) or os.path.islink(path):
-                            os.remove(path)
-                        elif os.path.isdir(path):
-                            shutil.rmtree(path)
-                    except Exception as exc:
-                        log.warning("Could not remove %s: %s", path, exc)
-                actions.append(f"Cleared spool directory: {spool_dir}")
+                    # Only clear control/temp files (start with 'c'), NOT data files (start with 'd')
+                    if entry.startswith('c') and not entry.startswith('d'):
+                        path = os.path.join(spool_dir, entry)
+                        try:
+                            if os.path.isfile(path) or os.path.islink(path):
+                                os.remove(path)
+                                cleared += 1
+                        except Exception as exc:
+                            log.warning("Could not remove %s: %s", path, exc)
+                actions.append(f"Cleared {cleared} spool temp files (preserved active jobs)")
             except FileNotFoundError:
                 actions.append(f"Spool directory {spool_dir} does not exist (ok)")
             except Exception as exc:
                 actions.append(f"Error clearing spool: {exc}")
 
-            # Try to start CUPS again after clearing spool
+            # Try to start CUPS again after clearing spool temps
+            time.sleep(1)
             if cups_start():
-                actions.append("CUPS started after spool clear")
+                actions.append("CUPS started after spool temp clear")
             else:
                 return {
                     "status": "error",
