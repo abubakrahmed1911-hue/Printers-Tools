@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IT Aman Printer Support Tool v3.4 — GTK3 Frontend
+IT Aman Printer Support Tool v3.8 — GTK3 Frontend
 
 Communicates with it-aman daemon via Unix socket.
 Language is selected once at startup and locked for the session.
@@ -22,7 +22,7 @@ import subprocess
 
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
 CONFIG_PATH = "/etc/it-aman/config.json"
-APP_VERSION = "3.7"
+APP_VERSION = "3.8"
 APP_NAME = "IT Aman - Printer Support Tool"
 DEVELOPER = "Developed by: IT Helpdesk Operation"
 
@@ -955,7 +955,7 @@ class DiagnosticScreen(Gtk.Box):
         status = result.get("status", "error")
 
         if status == "ok":
-            fixes = result.get("fixes", [])
+            fixes = result.get("fixes") or result.get("actions", [])
             if not fixes:
                 self.status_lbl.set_markup(
                     f"<span size='large' weight='bold' color='#4CAF50'>"
@@ -1535,12 +1535,21 @@ class ThermalPrinterScreen(Gtk.Box):
             pass
 
         if result.get("status") == "ok":
-            self.usb_detected = True
-            self.usb_status.set_markup(
-                f"<span size='large' weight='bold' color='#4CAF50'>"
-                f"{t('thermal_step3_found', lang)}</span>"
-            )
-            self.usb_icon.set_from_icon_name("emblem-default", Gtk.IconSize.DIALOG)
+            printers = result.get("printers", [])
+            if printers:
+                self.usb_detected = True
+                self.usb_status.set_markup(
+                    f"<span size='large' weight='bold' color='#4CAF50'>"
+                    f"{t('thermal_step3_found', lang)}</span>"
+                )
+                self.usb_icon.set_from_icon_name("emblem-default", Gtk.IconSize.DIALOG)
+            else:
+                self.usb_detected = False
+                self.usb_status.set_markup(
+                    f"<span size='large' weight='bold' color='#F44336'>"
+                    f"{t('thermal_step3_not_found', lang)}</span>"
+                )
+                self.usb_icon.set_from_icon_name("dialog-error", Gtk.IconSize.DIALOG)
         else:
             self.usb_detected = False
             self.usb_status.set_markup(
@@ -2344,9 +2353,15 @@ class ITAmanApp(Gtk.Window):
         # No back button on welcome
 
     def show_main_menu(self):
+        """Switch to the main menu screen."""
         screen = MainMenuScreen(self)
-        self.set_screen(screen, t("main_title", self.lang), f"v{APP_VERSION}",
-                         show_back=False)
+        self.set_screen(
+            screen, t("main_title", self.lang),
+            f"v{APP_VERSION}  •  {DEVELOPER}",
+            show_back=True, back_callback=self._quit_or_back,
+        )
+        # Trigger an update check when returning to main menu
+        self._check_for_updates()
 
     def show_paper_jam(self):
         screen = PaperJamScreen(self)
@@ -2393,7 +2408,7 @@ class ITAmanApp(Gtk.Window):
     def _on_update_check_result(self, result):
         if result.get("status") == "ok":
             latest = result.get("version", APP_VERSION)
-            if latest != APP_VERSION:
+            if self._compare_versions(latest, APP_VERSION) > 0:
                 # Only show if user hasn't already dismissed this version
                 if latest != self._update_dismissed_version:
                     self._show_update_banner(latest)
@@ -2463,10 +2478,42 @@ class ITAmanApp(Gtk.Window):
         self._update_dismissed_version = self._update_available_version
         self._hide_update_banner()
 
-    def _do_banner_update(self, btn):
-        """User clicked Update — show the update dialog."""
+    def _check_for_updates(self):
+        """Check GitHub for newer version in background."""
+        self.daemon.send_threaded({"action": "check_update"}, self._on_update_check_result, timeout=15)
+
+    def _compare_versions(self, v1, v2):
+        """Compare two version strings. Returns 1 if v1>v2, 0 if equal, -1 if v1<v2."""
+        def parse(v):
+            parts = []
+            for p in v.split("."):
+                try:
+                    parts.append(int(p))
+                except ValueError:
+                    parts.append(0)
+            return parts
+        p1, p2 = parse(v1), parse(v2)
+        maxlen = max(len(p1), len(p2))
+        p1.extend([0] * (maxlen - len(p1)))
+        p2.extend([0] * (maxlen - len(p2)))
+        for a, b in zip(p1, p2):
+            if a > b: return 1
+            elif a < b: return -1
+        return 0
+
+    def _do_update(self):
+        """Run the update process."""
+        lang = self.lang or "en"
         if self._update_available_version:
             UpdateDialog(self, self._update_available_version)
+
+    def _quit_or_back(self):
+        """On main menu, back button exits the app."""
+        Gtk.main_quit()
+
+    def _do_banner_update(self, btn):
+        """User clicked Update — run the update process."""
+        self._do_update()
 
     # ── dialogs ──
 

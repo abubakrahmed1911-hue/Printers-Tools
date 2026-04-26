@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-IT Aman Printer Daemon v3.4
+IT Aman Printer Daemon v3.8
 ============================
 A Unix socket daemon for managing CUPS printers on Linux.
 Runs as root, listens on /run/it-aman/it-aman.sock, and processes
@@ -48,7 +48,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "3.6"
+VERSION = "3.8"
 
 # Paths
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
@@ -115,26 +115,16 @@ ALLOWED_COMMANDS = {
     "get_version",
     "get_config",
     "set_language",
-    # GUI action aliases (also accepted)
-    "diagnose",
-    "scan_network",
-    "add_network_printer",
-    "install_thermal_driver",
-    "fix_spooler",
-    "detect_usb_printer",
     "list_printers",
     "repair_printer",
-    "update",
     "check_update",
-    # GUI action aliases (also accepted)
+    # GUI action aliases
     "diagnose",
     "scan_network",
     "add_network_printer",
     "install_thermal_driver",
     "fix_spooler",
     "detect_usb_printer",
-    "list_printers",
-    "repair_printer",
     "update",
 }
 
@@ -257,7 +247,7 @@ def download_file(url: str, dest: str, desc: str = "file") -> bool:
     try:
         os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
         req = urllib.request.Request(url, headers={
-            "User-Agent": "IT-Aman-Daemon/3.4",
+            "User-Agent": "IT-Aman-Daemon/3.8",
         })
         with urllib.request.urlopen(req, timeout=120) as resp:
             with open(dest, "wb") as fh:
@@ -281,7 +271,7 @@ def download_text(url: str, timeout: int = 30) -> str | None:
     """Download a small text file and return its content, or None on error."""
     try:
         req = urllib.request.Request(url, headers={
-            "User-Agent": "IT-Aman-Daemon/3.4",
+            "User-Agent": "IT-Aman-Daemon/3.8",
         })
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read().decode("utf-8", errors="replace").strip()
@@ -373,7 +363,7 @@ def http_probe_model(ip: str) -> str | None:
     for url in urls_to_try:
         try:
             req = urllib.request.Request(url, headers={
-                "User-Agent": "IT-Aman-Daemon/3.4",
+                "User-Agent": "IT-Aman-Daemon/3.8",
             })
             with urllib.request.urlopen(req, timeout=MODEL_PROBE_TIMEOUT) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
@@ -625,7 +615,7 @@ def handle_fix(params: dict) -> dict:
     Smart diagnostic: check CUPS status, stuck jobs, disabled printers,
     and attempt automatic fixes. Returns a detailed report.
     """
-    report = {"status": "ok", "actions": [], "issues_found": 0}
+    report = {"status": "ok", "actions": [], "fixes": [], "issues_found": 0}
 
     # 1. Check if CUPS is running
     if not cups_is_running():
@@ -696,6 +686,8 @@ def handle_fix(params: dict) -> dict:
         if errors:
             report["actions"].append(f"Recent CUPS errors: {errors[0][:200]}")
 
+    # Also provide "fixes" key for GUI compatibility
+    report["fixes"] = report["actions"]
     return report
 
 
@@ -1345,14 +1337,111 @@ def _install_sprt() -> dict:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+# ---- handle_list_printers (installed printers with status) ---------------
+
+def handle_list_printers(params: dict) -> dict:
+    """
+    List all INSTALLED CUPS printers with their status, device URI, and job counts.
+    Uses lpstat -p and lpstat -v for accurate information.
+    Returns: {status: "ok", printers: [{name, state, device, jobs}, ...]}
+    """
+    printers = []
+
+    # Get printer list from lpstat -p
+    rc, out, _ = run_cmd(["lpstat", "-p"])
+    if rc != 0 or not out:
+        return {"status": "ok", "printers": []}
+
+    for line in out.splitlines():
+        # Format: "printer NAME enabled/idle/stopped since ..."
+        # or: "printer NAME disabled since ..."
+        m = re.match(r'printer\s+(\S+)\s+(\w+)', line)
+        if m:
+            name = m.group(1)
+            state_raw = m.group(2).lower()
+
+            if state_raw in ("enabled", "idle", "processing"):
+                state = "enabled"
+            elif state_raw in ("disabled", "stopped"):
+                state = "disabled"
+            else:
+                state = state_raw
+
+            # Get device URI
+            _, dev_out, _ = run_cmd(["lpstat", "-v", name])
+            device = ""
+            if dev_out:
+                dm = re.search(r'device for \S+:\s+(\S+)', dev_out)
+                if dm:
+                    device = dm.group(1)
+
+            # Get job count
+            _, jobs_out, _ = run_cmd(["lpstat", "-o", name])
+            jobs = 0
+            if jobs_out:
+                jobs = len([l for l in jobs_out.splitlines() if l.strip()])
+
+            printers.append({
+                "name": name,
+                "state": state,
+                "device": device,
+                "jobs": jobs,
+            })
+
+    log.info("Listed %d installed printers", len(printers))
+    return {"status": "ok", "printers": printers}
+
+
+# ---- handle_repair_printer (enable specific printer + clear jobs) --------
+
+def handle_repair_printer(params: dict) -> dict:
+    """
+    Repair a specific printer by enabling it and clearing its job queue.
+    Params: name — the CUPS printer name.
+    """
+    name = params.get("name", "").strip()
+    if not name:
+        return {"status": "error", "message": "Printer name is required"}
+
+    if not is_printer_exists(name):
+        return {"status": "error", "message": f"Printer '{name}' does not exist"}
+
+    actions = []
+
+    # Cancel all jobs on this printer
+    rc, _, err = run_cmd(["cancel", "-a", name])
+    if rc == 0:
+        actions.append(f"Cleared all jobs on '{name}'")
+        log.info("Cleared jobs on printer '%s'", name)
+    else:
+        actions.append(f"No jobs to clear on '{name}'")
+
+    # Enable the printer
+    rc, _, err = run_cmd(["cupsenable", name])
+    if rc == 0:
+        actions.append(f"Enabled printer '{name}'")
+        log.info("Enabled printer '%s'", name)
+    else:
+        actions.append(f"Enable returned: {err}")
+        log.warning("cupsenable for '%s' returned: %s", name, err)
+
+    # Accept jobs on this printer
+    rc, _, err = run_cmd(["cupsaccept", name])
+    if rc == 0:
+        actions.append(f"Printer '{name}' is now accepting jobs")
+    else:
+        actions.append(f"cupsaccept returned: {err}")
+
+    return {"status": "ok", "actions": actions, "fixes": actions}
+
+
 # ---- handle_remove_printer ------------------------------------------------
 
 def handle_remove_printer(params: dict) -> dict:
     """
     Remove a printer from CUPS:
       1. Cancel all its jobs
-      2. Disable it
-      3. Delete it with lpadmin -x
+      2. Delete it with lpadmin -x
     """
     name = params.get("name", "").strip()
     if not name:
@@ -1360,21 +1449,14 @@ def handle_remove_printer(params: dict) -> dict:
 
     actions = []
 
-    # Cancel all jobs
+    # Cancel all jobs on this printer
     rc, _, err = run_cmd(["cancel", "-a", name])
     if rc == 0:
         actions.append(f"Cancelled all jobs on '{name}'")
     else:
-        actions.append(f"No jobs to cancel (or cancel failed): {err}")
+        actions.append(f"No jobs to cancel (or cancel failed)")
 
-    # Disable printer
-    rc, _, err = run_cmd(["cupsdisable", name])
-    if rc == 0:
-        actions.append(f"Disabled printer '{name}'")
-    else:
-        actions.append(f"Disable failed (non-fatal): {err}")
-
-    # Remove printer
+    # Remove printer (lpadmin -x automatically handles cleanup)
     rc, _, err = run_cmd(["lpadmin", "-x", name])
     if rc == 0:
         actions.append(f"Removed printer '{name}' successfully")
@@ -1390,43 +1472,52 @@ def handle_remove_printer(params: dict) -> dict:
 def handle_quick_fix_spooler(params: dict) -> dict:
     """
     Quick fix for a stuck spooler:
-      1. Stop CUPS
-      2. Clear /var/spool/cups/*
-      3. Start CUPS
+      1. Cancel all stuck jobs
+      2. Restart CUPS service
+      3. If still stuck, clear spool directory and restart again
     """
     actions = []
 
-    # Stop CUPS
-    if cups_stop():
-        actions.append("CUPS stopped")
+    # First: cancel all stuck print jobs
+    rc, _, _ = run_cmd(["cancel", "-a"])
+    if rc == 0:
+        actions.append("Cancelled all stuck print jobs")
+        log.info("Cancelled all print jobs")
     else:
-        return {"status": "error", "message": "Failed to stop CUPS", "actions": actions}
+        actions.append("No stuck jobs to cancel")
 
-    # Clear spool directory
-    spool_dir = "/var/spool/cups"
-    try:
-        for entry in os.listdir(spool_dir):
-            path = os.path.join(spool_dir, entry)
-            try:
-                if os.path.isfile(path) or os.path.islink(path):
-                    os.remove(path)
-                elif os.path.isdir(path):
-                    shutil.rmtree(path)
-            except Exception as exc:
-                log.warning("Could not remove %s: %s", path, exc)
-        actions.append(f"Cleared spool directory: {spool_dir}")
-    except FileNotFoundError:
-        actions.append(f"Spool directory {spool_dir} does not exist (ok)")
-    except Exception as exc:
-        actions.append(f"Error clearing spool: {exc}")
-
-    # Start CUPS
-    if cups_start():
-        actions.append("CUPS started")
+    # Second: restart CUPS
+    if cups_restart():
+        actions.append("CUPS service restarted")
+        log.info("CUPS restarted successfully")
     else:
-        return {"status": "error", "message": "Failed to start CUPS after clearing spool", "actions": actions}
+        actions.append("CUPS restart failed — trying full reset")
+        log.warning("CUPS restart failed, attempting full reset")
 
-    log.info("Quick fix spooler complete")
+        # Full reset: stop, clear spool, start
+        cups_stop()
+        spool_dir = "/var/spool/cups"
+        try:
+            for entry in os.listdir(spool_dir):
+                path = os.path.join(spool_dir, entry)
+                try:
+                    if os.path.isfile(path) or os.path.islink(path):
+                        os.remove(path)
+                    elif os.path.isdir(path):
+                        shutil.rmtree(path)
+                except Exception as exc:
+                    log.warning("Could not remove %s: %s", path, exc)
+            actions.append(f"Cleared spool directory")
+        except FileNotFoundError:
+            actions.append(f"Spool directory does not exist (ok)")
+        except Exception as exc:
+            actions.append(f"Error clearing spool: {exc}")
+
+        if cups_start():
+            actions.append("CUPS started after full reset")
+        else:
+            return {"status": "error", "message": "Failed to start CUPS after full reset", "actions": actions}
+
     return {"status": "ok", "actions": actions}
 
 
@@ -1435,10 +1526,18 @@ def handle_quick_fix_spooler(params: dict) -> dict:
 def handle_detect_usb_printers(params: dict) -> dict:
     """
     Detect USB printers connected to the system.
-    Uses lpinfo -v for URIs and lsusb for descriptions.
-    Returns list of {uri, description, type}.
+    Uses lpinfo -v for URIs, lsusb for descriptions,
+    and tries to load the usblp kernel module if no USB printers found.
+    Returns list of {uri, description, type, full_uri}.
     """
     printers = []
+
+    # Ensure usblp kernel module is loaded (required for USB printer detection)
+    rc, _, _ = run_cmd(["modprobe", "usblp"])
+    if rc == 0:
+        log.info("Loaded usblp kernel module")
+    else:
+        log.debug("usblp modprobe returned %d (may already be loaded or built-in)", rc)
 
     # Get USB URIs from lpinfo
     backends = get_cups_backends()
@@ -1454,12 +1553,9 @@ def handle_detect_usb_printers(params: dict) -> dict:
 
         # Try to match with lsusb description
         description = "USB Printer"
-        # Extract vendor from URI
         uri_lower = uri.lower()
         for line in lsusb_lines:
             line_lower = line.lower()
-            # Check if any part of the URI appears in lsusb line
-            # USB URIs often have the vendor name
             vendor_match = re.search(r'usb://([^/?]+)', uri)
             if vendor_match:
                 vendor = vendor_match.group(1).lower()
@@ -1473,6 +1569,24 @@ def handle_detect_usb_printers(params: dict) -> dict:
             "description": description,
             "type": "usb",
         })
+
+    # If no USB printers found via lpinfo, try lsusb to see if any USB printer device exists
+    if not printers:
+        for line in lsusb_lines:
+            line_lower = line.lower()
+            # Common USB printer keywords
+            if any(kw in line_lower for kw in ["printer", "thermal", "xprinter", "sprt", "pos", "receipt"]):
+                log.info("Found potential USB printer via lsusb: %s", line.strip())
+                # Extract vendor name from lsusb line
+                m = re.search(r'ID\s+\w+:\w+\s+(.*)', line)
+                desc = m.group(1).strip() if m else line.strip()
+                printers.append({
+                    "uri": "",
+                    "full_uri": "",
+                    "description": desc,
+                    "type": "usb",
+                    "note": "Detected via lsusb but not yet in CUPS — may need driver install",
+                })
 
     log.info("Detected %d USB printers", len(printers))
     return {"status": "ok", "printers": printers}
@@ -1897,6 +2011,8 @@ HANDLERS = {
     "install_thermal_brand": handle_install_thermal_brand,
     "detect_usb_printers": handle_detect_usb_printers,
     "discover_printers": handle_discover_printers,
+    "list_printers": handle_list_printers,
+    "repair_printer": handle_repair_printer,
     "clear_jobs": handle_clear_jobs,
     "test_print": handle_test_print,
     "update_all": handle_update_all,
@@ -1912,9 +2028,8 @@ ACTION_ALIASES = {
     "install_thermal_driver": "install_thermal_brand",
     "fix_spooler": "quick_fix_spooler",
     "detect_usb_printer": "detect_usb_printers",
-    "list_printers": "discover_printers",
-    "repair_printer": "fix",
     "update": "update_all",
+    # Note: list_printers and repair_printer are now real handlers, no alias needed
 }
 
 
@@ -2233,7 +2348,7 @@ def main():
     """Main entry point for the IT Aman Printer Daemon."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="IT Aman Printer Daemon v3.4")
+    parser = argparse.ArgumentParser(description="IT Aman Printer Daemon v3.8")
     parser.add_argument(
         "--foreground", "-f",
         action="store_true",
