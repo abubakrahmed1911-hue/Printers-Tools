@@ -560,13 +560,17 @@ class DaemonClient:
         self.socket_path = socket_path
 
     def send_command(self, command_dict, timeout=30):
-        """Send a JSON command to the daemon and return the response dict."""
+        """Send a JSON command to the daemon and return the response dict.
+        Protocol: newline-delimited JSON (send payload + \\n, receive until \\n).
+        """
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.settimeout(timeout)
             sock.connect(self.socket_path)
+            # Send: JSON + newline
             payload = json.dumps(command_dict) + "\n"
             sock.sendall(payload.encode("utf-8"))
+            # Receive: read until newline
             data = b""
             while True:
                 chunk = sock.recv(4096)
