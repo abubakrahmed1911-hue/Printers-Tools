@@ -1,6 +1,16 @@
 {
-  "version": "1.0",
+  "version": "1.1",
   "description": "Centralized printer definitions for IT Aman Printer Tool. Edit this file on GitHub to push definitions to ALL devices.",
+  "base_names": [
+    "Operation MF",
+    "Accountant MF",
+    "FS",
+    "HR MF",
+    "Reception MF",
+    "Manager MF",
+    "IT MF",
+    "GM MF"
+  ],
   "name_templates": [
     "Operation MF",
     "Accountant MF",
@@ -19,6 +29,7 @@
     "Reception 2 MF",
     "Manager 2 MF",
     "IT 2 MF",
+    "GM 2 MF",
     "Operation 3 MF",
     "Accountant 3 MF",
     "FS5",
@@ -37,9 +48,23 @@
       "description": "SPRT 80mm thermal printer"
     }
   },
+  "naming_rules": {
+    "description": "Auto-increment naming rules for printer names",
+    "MF_pattern": "BASE MF → BASE 2 MF → BASE 3 MF (e.g., Operation MF, Operation 2 MF, Operation 3 MF)",
+    "short_pattern": "BASE → BASE2 → BASE3 (e.g., FS, FS2, FS3)",
+    "examples": [
+      "Operation MF = first Operation multifunction printer",
+      "Operation 2 MF = second Operation multifunction printer",
+      "Accountant MF = first Accountant multifunction printer",
+      "FS = first FS printer",
+      "FS2 = second FS printer",
+      "FS3 = third FS printer"
+    ]
+  },
   "instructions": {
     "add_network_printer": "Add entries to the 'printers' array like: {\"name\": \"Operation MF\", \"ip\": \"192.168.1.50\", \"model\": \"Kyocera ECOSYS\", \"type\": \"network\"}",
     "add_thermal_printer": "Add entries like: {\"name\": \"FS\", \"type\": \"thermal\", \"brand\": \"xprinter\"}",
-    "name_templates": "Edit the 'name_templates' array to change available printer names. Names with numbers (FS2, FS3, Operation 2 MF) are auto-generated when duplicates exist."
+    "name_templates": "Edit the 'name_templates' array to change available printer names. The 'base_names' array defines the primary categories. Names with numbers are auto-generated when duplicates exist.",
+    "base_names": "Edit the 'base_names' array to change the primary naming categories. Each base name will auto-increment (e.g., FS → FS2 → FS3, Operation MF → Operation 2 MF → Operation 3 MF)"
   }
 }

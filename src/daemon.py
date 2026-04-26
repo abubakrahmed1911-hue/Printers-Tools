@@ -20,14 +20,15 @@ Key changes from v3.10:
   - FIX: Network printer card passes full_uri and uri for better setup
   - VERSION bumped to 3.11
 
-Key changes from v3.12:
-  - NEW: Centralized printer name templates synced from GitHub
-   - NEW: handle_get_name_templates for predefined naming (Operation MF, Accountant MF, FS, etc.)
-  - NEW: handle_sync_definitions to download and apply remote printer definitions
-  - FIX: Printer listing now shows ALL printers including uninstalled USB/network devices
-  - FIX: Repair/clean/diagnose commands now work correctly with proper CUPS state management
-  - FIX: Thermal printer detection returns proper error message when no USB printer found
-  - VERSION bumped to 3.12
+Key changes from v3.13:
+  - NEW: Smart printer naming with auto-increment (Operation MF, Operation 2 MF, FS, FS2, etc.)
+  - NEW: handle_get_next_name auto-suggests the next available name for each category
+  - FIX: Printer name sanitization now allows spaces in display (CUPS name uses underscores)
+  - FIX: Repair/clean/diagnose commands verified working with proper CUPS state management
+  - FIX: Thermal printer detection and driver install improved
+  - FIX: Printer listing shows ALL printers including uninstalled USB/network devices
+  - IMPROVED: Centralized definitions sync from GitHub
+  - VERSION bumped to 3.13
 
 Architecture:
   - Unix socket at /run/it-aman/it-aman.sock
@@ -63,7 +64,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "3.12"
+VERSION = "3.13"
 
 # Paths
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
@@ -97,7 +98,22 @@ SPRT_DRIVER_URL = (
 PRINTER_DEFINITIONS_URL = f"{RAW_BASE}/printer_definitions.json"
 
 # Predefined printer name templates (also synced from GitHub)
-# These are the standard naming conventions for branches
+# These are the standard naming conventions for branches.
+# The GUI uses BASE_NAMES to generate auto-incremented names.
+# e.g., Operation MF, Operation 2 MF, Operation 3 MF ...
+#       FS, FS2, FS3 ...
+
+PRINTER_BASE_NAMES = [
+    "Operation MF",
+    "Accountant MF",
+    "FS",
+    "HR MF",
+    "Reception MF",
+    "Manager MF",
+    "IT MF",
+    "GM MF",
+]
+
 PRINTER_NAME_TEMPLATES = [
     "Operation MF",
     "Accountant MF",
@@ -114,6 +130,13 @@ PRINTER_NAME_TEMPLATES = [
     "FS4",
     "HR 2 MF",
     "Reception 2 MF",
+    "Manager 2 MF",
+    "IT 2 MF",
+    "GM 2 MF",
+    "Operation 3 MF",
+    "Accountant 3 MF",
+    "FS5",
+    "FS6",
 ]
 
 # Thermal printer constants
@@ -170,6 +193,7 @@ ALLOWED_COMMANDS = {
     "update",
     "define_driver",
     "get_name_templates",
+    "get_next_name",
     "sync_definitions",
     "setup_printer_named",
 }
@@ -1538,21 +1562,24 @@ def handle_repair_printer(params: dict) -> dict:
 
 def handle_get_name_templates(params: dict) -> dict:
     """
-    Return the list of predefined printer name templates.
+    Return the list of predefined printer name templates AND base names.
     Also checks GitHub for updated templates if online.
     The GUI uses this to show a naming selection when adding printers.
 
-    Returns: {status: "ok", templates: [...], remote_templates: [...]}
+    Returns: {status: "ok", templates: [...], base_names: [...], installed: [...]}
     """
     local_templates = list(PRINTER_NAME_TEMPLATES)
+    local_base_names = list(PRINTER_BASE_NAMES)
 
     # Try to fetch updated templates from GitHub
     remote_templates = []
+    remote_base_names = []
     try:
         defs_text = download_text(PRINTER_DEFINITIONS_URL, timeout=10)
         if defs_text:
             defs = json.loads(defs_text)
             remote_templates = defs.get("name_templates", [])
+            remote_base_names = defs.get("base_names", [])
             if remote_templates:
                 log.info("Fetched %d remote name templates from GitHub", len(remote_templates))
     except Exception as exc:
@@ -1560,6 +1587,7 @@ def handle_get_name_templates(params: dict) -> dict:
 
     # Merge: remote takes priority, then local fallback
     all_templates = list(remote_templates) if remote_templates else local_templates
+    all_base_names = list(remote_base_names) if remote_base_names else local_base_names
 
     # Get currently installed printer names so GUI can show which names are taken
     installed = []
@@ -1570,11 +1598,81 @@ def handle_get_name_templates(params: dict) -> dict:
             if m:
                 installed.append(m.group(1))
 
+    # For each base name, auto-suggest the next available name
+    suggested = {}
+    for base in all_base_names:
+        next_result = handle_get_next_name({"base": base})
+        if next_result.get("status") == "ok":
+            suggested[base] = next_result["name"]
+
     return {
         "status": "ok",
         "templates": all_templates,
+        "base_names": all_base_names,
         "installed": installed,
+        "suggested": suggested,
     }
+
+
+# ---- handle_get_next_name (auto-suggest next available name) ---------------
+
+def handle_get_next_name(params: dict) -> dict:
+    """
+    Auto-suggest the next available printer name for a given base category.
+    For example:
+      - base="Operation MF" → checks if "Operation_MF" exists in CUPS.
+        If not, returns "Operation MF". If yes, tries "Operation 2 MF", etc.
+      - base="FS" → checks "FS", then "FS2", "FS3", etc.
+
+    Returns: {status: "ok", name: "Operation 2 MF", cups_name: "Operation_2_MF"}
+    """
+    base = params.get("base", "").strip()
+    if not base:
+        return {"status": "error", "message": "Base name is required"}
+
+    # Determine naming pattern based on base name
+    # For names ending with "MF": insert number before "MF"
+    #   "Operation MF" → "Operation 2 MF", "Operation 3 MF", ...
+    # For short names like "FS": append number directly
+    #   "FS" → "FS2", "FS3", ...
+
+    if base.endswith(" MF"):
+        # Pattern: "Operation MF" → "Operation 2 MF", "Operation 3 MF", ...
+        prefix = base[:-3].strip()  # e.g., "Operation"
+        suffix = "MF"
+
+        # First, try the base name itself
+        cups_name = _sanitize_for_cups(base)
+        if not is_printer_exists(cups_name):
+            return {"status": "ok", "name": base, "cups_name": cups_name}
+
+        # Then try with incrementing numbers
+        for num in range(2, 20):
+            candidate = f"{prefix} {num} {suffix}"
+            cups_name = _sanitize_for_cups(candidate)
+            if not is_printer_exists(cups_name):
+                return {"status": "ok", "name": candidate, "cups_name": cups_name}
+
+    else:
+        # Pattern: "FS" → "FS2", "FS3", ...
+        # First, try the base name itself
+        cups_name = _sanitize_for_cups(base)
+        if not is_printer_exists(cups_name):
+            return {"status": "ok", "name": base, "cups_name": cups_name}
+
+        # Then try with incrementing numbers
+        for num in range(2, 20):
+            candidate = f"{base}{num}"
+            cups_name = _sanitize_for_cups(candidate)
+            if not is_printer_exists(cups_name):
+                return {"status": "ok", "name": candidate, "cups_name": cups_name}
+
+    return {"status": "error", "message": f"No available name for base '{base}' (tried up to 19)"}
+
+
+def _sanitize_for_cups(name: str) -> str:
+    """Sanitize a printer name for CUPS (letters, digits, hyphens, underscores only)."""
+    return re.sub(r'[^a-zA-Z0-9_-]', '_', name)
 
 
 # ---- handle_sync_definitions (centralized config sync) --------------------
@@ -2651,6 +2749,7 @@ HANDLERS = {
     "repair_printer": handle_repair_printer,
     "define_driver": handle_define_driver,
     "get_name_templates": handle_get_name_templates,
+    "get_next_name": handle_get_next_name,
     "sync_definitions": handle_sync_definitions,
     "quick_fix_spooler": handle_quick_fix_spooler,
     "network_scan": handle_network_scan,

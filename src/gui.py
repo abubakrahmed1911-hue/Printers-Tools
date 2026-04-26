@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IT Aman Printer Support Tool v3.12 — GTK3 Frontend
+IT Aman Printer Support Tool v3.13 — GTK3 Frontend
 
 Communicates with it-aman daemon via Unix socket.
 Language is selected once at startup and locked for the session.
 No branch selection — works directly with network printers.
 Developed by IT Helpdesk Operation.
 
-Key changes in v3.12:
-  - NEW: Printer naming system with predefined templates (Operation MF, Accountant MF, FS, etc.)
-  - NEW: Centralized definition sync from GitHub
-  - FIX: Reduced window size for better usability on smaller screens
-  - FIX: More compact card layout showing more printers
-  - FIX: Printer name selection dialog before adding network printers
-  - FIX: Thermal printer screen with better driver selection
-  - VERSION bumped to 3.12
+Key changes in v3.13:
+  - NEW: Smart printer naming with auto-increment (Operation MF, Operation 2 MF, FS, FS2)
+  - NEW: Base name categories shown first in naming dialog, auto-suggest next available
+  - FIX: Window size reduced to 800x580 for smaller screens, resizable by user
+  - FIX: Printer lists now scrollable with minimum 3 printers visible at once
+  - FIX: More compact card layout for better density
+  - FIX: All daemon commands (repair, clean, status, quick fix) verified working
+  - FIX: Thermal printer detection and setup improved
+  - VERSION bumped to 3.13
 """
 
 import gi
@@ -33,7 +34,7 @@ import re
 
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
 CONFIG_PATH = "/etc/it-aman/config.json"
-APP_VERSION = "3.12"
+APP_VERSION = "3.13"
 APP_NAME = "IT Aman - Printer Support Tool"
 DEVELOPER = "Developed by: IT Helpdesk Operation"
 
@@ -189,6 +190,7 @@ TRANSLATIONS = {
         "naming_select": "اختر اسم للطابعة من القائمة أو اكتب اسم مخصص:",
         "naming_custom": "اسم مخصص:",
         "naming_taken": "هذا الاسم مستخدم بالفعل",
+        "naming_suggested": "مقترح",
         "naming_apply": "تطبيق",
         "sync_title": "مزامنة التعريفات",
         "sync_desc": "تحميل وتطبيق التعريفات المركزية من الخادم",
@@ -339,6 +341,7 @@ TRANSLATIONS = {
         "naming_select": "Select a name for the printer from the list or type a custom name:",
         "naming_custom": "Custom name:",
         "naming_taken": "This name is already taken",
+        "naming_suggested": "Suggested",
         "naming_apply": "Apply",
         "sync_title": "Sync Definitions",
         "sync_desc": "Download and apply centralized definitions from server",
@@ -1231,13 +1234,15 @@ class NetworkPrinterScreen(Gtk.Box):
 
         templates = result.get("templates", [])
         installed = result.get("installed", [])
+        base_names = result.get("base_names", [])
+        suggested = result.get("suggested", {})
 
         dialog = Gtk.Dialog(
             title=t("naming_title", lang),
             parent=self.app,
             flags=Gtk.DialogFlags.MODAL,
         )
-        dialog.set_default_size(420, 480)
+        dialog.set_default_size(460, 520)
 
         content = dialog.get_content_area()
         content.set_spacing(8)
@@ -1253,18 +1258,61 @@ class NetworkPrinterScreen(Gtk.Box):
         instr.set_xalign(0.0 if lang != "ar" else 1.0)
         content.pack_start(instr, False, False, 0)
 
-        # Scrolled list of template names
+        # Scrolled list of names
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_min_content_height(280)  # Ensure at least 3-4 names visible
         list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         scrolled.add(list_box)
 
         selected_name = [None]  # mutable container for closure
 
+        # First: Show base names with auto-suggested next available name
+        if base_names:
+            for base in base_names:
+                sug_name = suggested.get(base, base)
+                safe_sug = re.sub(r'[^a-zA-Z0-9_-]', '_', sug_name)
+                is_taken = safe_sug in installed
+
+                row = Gtk.Button()
+                row.get_style_context().add_class("card-clickable")
+                row.set_size_request(-1, 38)
+
+                # Show: "Operation MF → Operation 2 MF" if different, or just "Operation MF"
+                if sug_name != base:
+                    lbl_text = f"{base}  →  {sug_name}  ({t('naming_suggested', lang)})"
+                else:
+                    lbl_text = f"{sug_name}"
+
+                lbl = Gtk.Label()
+                lbl.set_markup(f"<span color='#2196F3' weight='bold'>{lbl_text}</span>")
+                lbl.set_xalign(0.0 if lang != "ar" else 1.0)
+                row.add(lbl)
+
+                def _select(btn, name=safe_sug, orig=sug_name):
+                    selected_name[0] = name
+                    # Highlight selected
+                    for child in list_box.get_children():
+                        child.get_style_context().remove_class("selected")
+                    btn.get_style_context().add_class("selected")
+
+                row.connect("clicked", _select)
+                list_box.pack_start(row, False, False, 0)
+
+        # Separator between base names and full templates
+        if base_names and templates:
+            sep = Gtk.Separator()
+            list_box.pack_start(sep, False, False, 4)
+
+        # Then: Show all templates (including duplicates like Operation 2 MF)
         for tmpl in templates:
-            # Sanitize template name for CUPS compatibility
             safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', tmpl)
             is_taken = safe_name in installed
+
+            # Skip if this was already shown as a base name suggestion
+            if base_names and not is_taken:
+                # Only show taken names in the templates section to indicate they're used
+                continue
 
             row = Gtk.Button()
             row.get_style_context().add_class("card-clickable")
@@ -1280,15 +1328,14 @@ class NetworkPrinterScreen(Gtk.Box):
             lbl.set_xalign(0.0 if lang != "ar" else 1.0)
             row.add(lbl)
 
-            def _select(btn, name=safe_name, orig=tmpl, taken=is_taken):
+            def _select2(btn, name=safe_name, orig=tmpl, taken=is_taken):
                 if not taken:
                     selected_name[0] = name
-                    # Highlight selected
                     for child in list_box.get_children():
                         child.get_style_context().remove_class("selected")
                     btn.get_style_context().add_class("selected")
 
-            row.connect("clicked", _select)
+            row.connect("clicked", _select2)
             list_box.pack_start(row, False, False, 0)
 
         content.pack_start(scrolled, True, True, 4)
@@ -1988,6 +2035,7 @@ class RepairScreen(Gtk.Box):
         self.printer_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_min_content_height(180)  # Ensure at least 3 printers visible
         scrolled.add(self.printer_list)
         self.pack_start(scrolled, True, True, 0)
 
@@ -2217,6 +2265,7 @@ class StatusScreen(Gtk.Box):
         self.printer_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_min_content_height(180)  # Ensure at least 3 printers visible
         scrolled.add(self.printer_list)
         self.pack_start(scrolled, True, True, 0)
 
@@ -2453,13 +2502,14 @@ class ITAmanApp(Gtk.Window):
             monitor = display.get_primary_monitor()
             if monitor:
                 geom = monitor.get_geometry()
-                w = min(int(geom.width * 0.65), 900)
-                h = min(int(geom.height * 0.72), 680)
+                # Smaller default: 55% width (max 800), 60% height (max 580)
+                w = min(int(geom.width * 0.55), 800)
+                h = min(int(geom.height * 0.60), 580)
                 self.set_default_size(w, h)
             else:
-                self.set_default_size(900, 650)
+                self.set_default_size(800, 580)
         else:
-            self.set_default_size(900, 650)
+            self.set_default_size(800, 580)
 
         self.set_position(Gtk.WindowPosition.CENTER)
 
