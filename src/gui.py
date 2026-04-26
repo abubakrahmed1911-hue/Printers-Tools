@@ -22,8 +22,9 @@ import subprocess
 
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
 CONFIG_PATH = "/etc/it-aman/config.json"
-APP_VERSION = "3.4"
+APP_VERSION = "3.7"
 APP_NAME = "IT Aman - Printer Support Tool"
+DEVELOPER = "Developed by: IT Helpdesk Operation"
 
 VIDEO_URL_GDRIVE = (
     "https://drive.google.com/file/d/1e3-7J6hr5yd3uyXSSu8rPJkFwMw8s-My/view?usp=sharing"
@@ -351,6 +352,24 @@ window {
     font-size: 13px;
 }
 
+.header-bar .dev-label {
+    color: rgba(255,255,255,0.6);
+    font-size: 11px;
+}
+
+.update-banner {
+    background: linear-gradient(135deg, #FFF3E0, #FFE0B2);
+    border: 2px solid #FF9800;
+    border-radius: 8px;
+    padding: 8px 12px;
+}
+
+.update-banner label {
+    color: #E65100;
+    font-weight: bold;
+    font-size: 13px;
+}
+
 .card {
     background-color: @card_bg;
     border-radius: 12px;
@@ -674,7 +693,7 @@ class WelcomeScreen(Gtk.Box):
         self.pack_start(title_lbl, False, False, 0)
 
         # Developer info
-        dev_lbl = Gtk.Label("Developed by: IT Department — Aman Security Company")
+        dev_lbl = Gtk.Label(DEVELOPER)
         dev_lbl.get_style_context().add_class("card-desc")
         dev_lbl.set_halign(Gtk.Align.CENTER)
         self.pack_start(dev_lbl, False, False, 0)
@@ -2195,8 +2214,13 @@ class ITAmanApp(Gtk.Window):
 
         self.show_welcome()
 
-        # Background update check
-        GLib.timeout_add_seconds(2, self._check_update)
+        # Update notification banner (hidden by default)
+        self._update_banner = None
+        self._update_available_version = None
+        self._update_dismissed_version = None  # track dismissed updates so we don't re-show
+
+        # Background update check: first after 3s, then every 60s
+        GLib.timeout_add_seconds(3, self._periodic_update_check)
 
     # ── setup ──
 
@@ -2249,6 +2273,12 @@ class ITAmanApp(Gtk.Window):
         self.header_sub.get_style_context().add_class("subtitle-label")
         self.header_sub.set_halign(Gtk.Align.CENTER)
         self.header.pack_start(self.header_sub, True, True, 4)
+
+        # Developer branding in header
+        dev_label = Gtk.Label(label=DEVELOPER)
+        dev_label.get_style_context().add_class("dev-label")
+        dev_label.set_halign(Gtk.Align.CENTER)
+        self.header.pack_start(dev_label, True, True, 2)
 
         # Content
         self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -2355,14 +2385,88 @@ class ITAmanApp(Gtk.Window):
 
     # ── update check ──
 
-    def _check_update(self):
-        def on_result(result):
-            if result.get("status") == "ok":
-                latest = result.get("version", APP_VERSION)
-                if latest != APP_VERSION:
-                    UpdateDialog(self, latest)
-        self.daemon.send_threaded({"action": "check_update"}, on_result, timeout=15)
-        return False
+    def _periodic_update_check(self):
+        """Check for updates every 60 seconds. Show banner if update found."""
+        self.daemon.send_threaded({"action": "check_update"}, self._on_update_check_result, timeout=15)
+        return True  # keep the timer running
+
+    def _on_update_check_result(self, result):
+        if result.get("status") == "ok":
+            latest = result.get("version", APP_VERSION)
+            if latest != APP_VERSION:
+                # Only show if user hasn't already dismissed this version
+                if latest != self._update_dismissed_version:
+                    self._show_update_banner(latest)
+            else:
+                # Up to date — hide banner if showing
+                self._hide_update_banner()
+
+    def _show_update_banner(self, new_version):
+        """Show a non-intrusive update banner at the top of the window."""
+        if self._update_banner is not None:
+            # Already showing — update the version text if needed
+            if self._update_available_version == new_version:
+                return
+            # Remove old banner
+            self._hide_update_banner()
+
+        self._update_available_version = new_version
+        lang = self.lang or "en"
+
+        banner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        banner.get_style_context().add_class("update-banner")
+        banner.set_margin_start(12)
+        banner.set_margin_end(12)
+        banner.set_margin_top(4)
+        banner.set_margin_bottom(4)
+
+        icon = Gtk.Image.new_from_icon_name("software-update-available", Gtk.IconSize.MENU)
+        banner.pack_start(icon, False, False, 0)
+
+        msg = t("update_available", lang) + f"  ({APP_VERSION} → {new_version})"
+        msg_lbl = Gtk.Label(label=msg)
+        msg_lbl.set_halign(Gtk.Align.START)
+        banner.pack_start(msg_lbl, True, True, 0)
+
+        update_btn = Gtk.Button(label=t("update_download", lang))
+        update_btn.get_style_context().add_class("btn-success")
+        update_btn.set_size_request(120, 30)
+        update_btn.connect("clicked", self._do_banner_update)
+        banner.pack_start(update_btn, False, False, 0)
+
+        dismiss_btn = Gtk.Button(label="✕")
+        dismiss_btn.set_size_request(30, 30)
+        dismiss_btn.connect("clicked", self._dismiss_update_banner)
+        banner.pack_start(dismiss_btn, False, False, 0)
+
+        banner.show_all()
+
+        # Insert at top of the main container
+        main_box = self.get_child()
+        if main_box:
+            main_box.pack_start(banner, False, False, 0)
+            main_box.reorder_child(banner, 0)
+
+        self._update_banner = banner
+
+    def _hide_update_banner(self):
+        """Remove the update banner from the window."""
+        if self._update_banner is not None:
+            main_box = self.get_child()
+            if main_box:
+                main_box.remove(self._update_banner)
+            self._update_banner = None
+            self._update_available_version = None
+
+    def _dismiss_update_banner(self, btn=None):
+        """User dismissed the update — remember so we don't re-show for this version."""
+        self._update_dismissed_version = self._update_available_version
+        self._hide_update_banner()
+
+    def _do_banner_update(self, btn):
+        """User clicked Update — show the update dialog."""
+        if self._update_available_version:
+            UpdateDialog(self, self._update_available_version)
 
     # ── dialogs ──
 
