@@ -1577,17 +1577,18 @@ def handle_update_all(params: dict) -> dict:
     Check for and apply updates from the public GitHub repository.
     NO token needed — repo is public, uses raw.githubusercontent.com URLs.
 
-    Simple update process (no manifest/signature needed for public repo):
+    Update process (with Ed25519 signature verification):
       1. Download version.json from raw.githubusercontent.com
       2. Compare versions
-      3. Download all known files directly from GitHub
-      4. Replace local files, restart daemon
+      3. Download update_manifest.json, verify Ed25519 signature
+      4. Download new files (SHA256 verified), replace, restart daemon
 
     To release an update:
       1. Edit files locally
       2. Change VERSION in daemon.py
       3. Change version in version.json
-      4. git add -A && git commit -m "v3.5" && git push
+      4. Run: python3 generate_manifest.py
+      5. git add -A && git commit -m "v3.5" && git push
     """
     report = {"status": "ok", "actions": []}
 
@@ -1616,18 +1617,40 @@ def handle_update_all(params: dict) -> dict:
 
     log.info("Update available: %s -> %s", VERSION, remote_version)
 
-    # --- Step 2: Download all known files ---
-    # Files that make up the application (relative to repo root)
-    UPDATE_FILES = [
-        "src/daemon.py",
-        "src/gui.py",
-        "version.json",
-        "public.pem",
-        ".gitignore",
-    ]
+    # --- Step 2: Fetch update manifest ---
+    manifest_url = f"{RAW_BASE}/update_manifest.json"
+    manifest_text = download_text(manifest_url)
+    if not manifest_text:
+        return {"status": "error", "message": "Failed to fetch update_manifest.json"}
 
+    try:
+        manifest = json.loads(manifest_text)
+    except json.JSONDecodeError as exc:
+        return {"status": "error", "message": f"Invalid update_manifest.json: {exc}"}
+
+    # --- Step 3: Verify Ed25519 signature ---
+    signature_b64 = manifest.get("signature", "")
+    public_key_b64 = manifest.get("public_key", "")
+    files_list = manifest.get("files", [])
+
+    if not signature_b64 or not public_key_b64:
+        return {"status": "error", "message": "Update manifest missing signature or public_key — update rejected for security"}
+
+    if not files_list:
+        return {"status": "error", "message": "Update manifest has no files to update"}
+
+    try:
+        sig_valid = _verify_ed25519_signature(
+            public_key_b64, signature_b64, files_list
+        )
+        if not sig_valid:
+            return {"status": "error", "message": "Ed25519 signature verification FAILED — update rejected"}
+        report["actions"].append("Ed25519 signature verified ✓")
+    except Exception as exc:
+        return {"status": "error", "message": f"Signature verification error: {exc}"}
+
+    # --- Step 4: Download and replace files ---
     install_dir = os.path.dirname(os.path.abspath(__file__))
-    # Parent dir holds version.json, public.pem, etc.
     base_dir = os.path.dirname(install_dir)  # /opt/it-aman
     backup_dir = base_dir + ".backup"
 
@@ -1642,7 +1665,12 @@ def handle_update_all(params: dict) -> dict:
 
     # Download each file
     updated_files = []
-    for remote_path in UPDATE_FILES:
+    for file_info in files_list:
+        remote_path = file_info.get("path", "")
+        expected_sha256 = file_info.get("sha256", "")
+        if not remote_path:
+            continue
+
         download_url = f"{RAW_BASE}/{remote_path}"
         dest_path = os.path.join(base_dir, remote_path)
 
@@ -1652,6 +1680,18 @@ def handle_update_all(params: dict) -> dict:
         if not download_file(download_url, tmp_dest, remote_path):
             report["actions"].append(f"Failed to download {remote_path}")
             continue
+
+        # Verify SHA256 if provided
+        if expected_sha256:
+            actual_sha256 = _sha256_file(tmp_dest)
+            if actual_sha256 != expected_sha256:
+                log.error(
+                    "SHA256 mismatch for %s: expected %s, got %s",
+                    remote_path, expected_sha256, actual_sha256,
+                )
+                os.remove(tmp_dest)
+                report["actions"].append(f"SHA256 mismatch for {remote_path} — skipped")
+                continue
 
         # Replace the file
         try:
@@ -1674,12 +1714,12 @@ def handle_update_all(params: dict) -> dict:
             pass
         return {"status": "error", "message": "No files were successfully updated", "actions": report["actions"]}
 
-    # --- Step 3: Update config with new version ---
+    # --- Step 5: Update config with new version ---
     cfg = load_config()
     cfg["version"] = remote_version
     save_config(cfg)
 
-    # --- Step 4: Restart daemon ---
+    # --- Step 6: Restart daemon ---
     report["actions"].append(f"Updated {len(updated_files)} file(s)")
     report["actions"].append("Daemon will restart to apply updates")
     report["new_version"] = remote_version
