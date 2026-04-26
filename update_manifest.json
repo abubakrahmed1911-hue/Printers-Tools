@@ -1,26 +1,31 @@
 {
+  "version": "3.12",
   "files": [
     {
       "path": "src/daemon.py",
-      "sha256": "e5b10b4b0d3c919c164b02cc0d2b032619c8e229dbe87e950a28e38b69789306"
+      "sha256": "b41ec4d13d32272697c4d49bf85491108c68226a6a2489d6f0bd90e4a17f05a5"
     },
     {
       "path": "src/gui.py",
-      "sha256": "00116b1ab08aedcb5ce5d8fadc6de556ef4112a36868413175deb66f0d858213"
+      "sha256": "6cdac701a4ebd017fe88f4bd2a5251bb5f25e716a1a515853dcc97475b7fe752"
+    },
+    {
+      "path": "install.sh",
+      "sha256": "b2b30557e1b2937674abec9402990205c7036730e6f81425baa47f338fe54df3"
     },
     {
       "path": "version.json",
-      "sha256": "b6703b1aa73ddf38d9f6167701c871648cddba2b877a3de616e6e4885166a3ff"
+      "sha256": "6e2e4e203591c7082b3186de67572065dc21300152a46e1c4b46eb16a5fa9d0e"
     },
     {
       "path": "public.pem",
-      "sha256": "cc8bce6ab95ddfe3a084320d266adeb8ee13f62390e311fff9e51cccc04c0d59"
+      "sha256": "110623df94b4006c5115fde530c65ccc2839d8099b40a0cde3806d921a205063"
     },
     {
-      "path": ".gitignore",
-      "sha256": "1f29ddbc3213ff88e4448655af9c4c4f9baaf72e7e38852fe077b6a63a004137"
+      "path": "printer_definitions.json",
+      "sha256": "940459b734895da989100cfe392589b501730a8f2da099a0206db4581feac15f"
     }
   ],
-  "signature": "zuu5OuV+00/42wnv+i5e16xFBaasYmEdZiqvyyPrs2/bcP5awbTx5PfsynBSgOGS4dxUHVnfYCrNAMmnWmhKAw==",
-  "public_key": "bBtrjHKyIelY2EBlxcdEfskgEXeXyxHVxUoz/WyIR5U="
+  "signature": "",
+  "public_key": ""
 }
