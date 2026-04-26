@@ -64,7 +64,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "3.15"
+VERSION = "3.16"
 
 # Paths
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
@@ -128,9 +128,20 @@ PRINTER_NAME_TEMPLATES = [
 ]
 
 # Thermal printer constants
-SPRT_PPD_DEST = "/usr/share/cups/model/SPRIT/80mmSeries.ppd"
+SPRT_PPD_DEST = "/usr/share/cups/model/80mmSeries.ppd"
 XPRINTER_PRINTER_NAME = "xp80"
 SPRT_PRINTER_NAME = "SPRT"
+
+# Local driver files (installed by install.sh from /opt/it-aman/drivers/)
+LOCAL_DRIVERS_DIR = "/opt/it-aman/drivers"
+LOCAL_PPD = os.path.join(LOCAL_DRIVERS_DIR, "80mmSeries.ppd")
+LOCAL_FILTERS = {
+    "rastertoprinter": os.path.join(LOCAL_DRIVERS_DIR, "rastertoprinter"),
+    "rastertoprintercm": os.path.join(LOCAL_DRIVERS_DIR, "rastertoprintercm"),
+    "rastertoprinterlm": os.path.join(LOCAL_DRIVERS_DIR, "rastertoprinterlm"),
+}
+CUPS_FILTER_DIR = "/usr/lib/cups/filter"
+CUPS_MODEL_DIR = "/usr/share/cups/model"
 
 # Network scan defaults
 SCAN_TCP_WORKERS = 64
@@ -1205,21 +1216,31 @@ def _install_xprinter(params=None) -> dict:
         run_cmd(["lpadmin", "-x", XPRINTER_PRINTER_NAME])
         report["actions"].append(f"Removed existing printer '{XPRINTER_PRINTER_NAME}'")
 
+    # Step 1: Install local driver files (from /opt/it-aman/drivers/)
+    local_actions = _install_local_drivers()
+    report["actions"].extend(local_actions)
+
     tmp_dir = tempfile.mkdtemp(prefix="xprinter_")
     try:
-        # Download the installer binary
-        installer_path = os.path.join(tmp_dir, "install-xp80")
-        if not download_file(XPRINTER_DRIVER_URL, installer_path, "XPrinter XP-80 installer"):
-            return {"status": "error", "message": "Failed to download XPrinter driver"}
+        # Step 2: If no local files, download the installer binary
+        if not local_actions:
+            installer_path = os.path.join(tmp_dir, "install-xp80")
+            if not download_file(XPRINTER_DRIVER_URL, installer_path, "XPrinter XP-80 installer"):
+                return {"status": "error", "message": "Failed to download XPrinter driver and no local files found"}
 
-        # Make executable and run
-        os.chmod(installer_path, 0o755)
-        rc, out, err = run_cmd(["bash", installer_path], timeout=120)
-        if rc != 0:
-            report["actions"].append(f"Installer returned code {rc}: {err}")
-            log.warning("XPrinter installer exit code %d: %s", rc, err)
+            # Make executable and run
+            os.chmod(installer_path, 0o755)
+            rc, out, err = run_cmd(["bash", installer_path], timeout=120)
+            if rc != 0:
+                report["actions"].append(f"Installer returned code {rc}: {err}")
+                log.warning("XPrinter installer exit code %d: %s", rc, err)
+            else:
+                report["actions"].append("XPrinter installer ran successfully")
         else:
-            report["actions"].append("XPrinter installer ran successfully")
+            # Local drivers installed - also try the local PPD for XPrinter
+            local_ppd = os.path.join(CUPS_MODEL_DIR, "80mmSeries.ppd")
+            if os.path.isfile(local_ppd):
+                report["actions"].append("Using locally installed thermal driver files")
 
         # Restart CUPS to pick up new PPDs/filters
         cups_restart()
@@ -1282,13 +1303,76 @@ def _install_xprinter(params=None) -> dict:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def _install_local_drivers() -> list:
+    """Install thermal printer drivers from local /opt/it-aman/drivers/ directory.
+    These files are placed by install.sh during initial setup or update.
+    Returns list of action descriptions.
+    """
+    actions = []
+
+    # Install CUPS filter files
+    for name, src_path in LOCAL_FILTERS.items():
+        dst_path = os.path.join(CUPS_FILTER_DIR, name)
+        if os.path.isfile(src_path):
+            try:
+                os.makedirs(CUPS_FILTER_DIR, exist_ok=True)
+                shutil.copy2(src_path, dst_path)
+                os.chmod(dst_path, 0o755)
+                actions.append(f"Installed filter: {dst_path}")
+                log.info("Installed thermal filter: %s -> %s", src_path, dst_path)
+            except Exception as exc:
+                actions.append(f"Failed to install filter {name}: {exc}")
+                log.error("Failed to install filter %s: %s", name, exc)
+        else:
+            log.debug("Local filter not found: %s", src_path)
+
+    # Install PPD file
+    if os.path.isfile(LOCAL_PPD):
+        try:
+            os.makedirs(CUPS_MODEL_DIR, exist_ok=True)
+            ppd_dest = os.path.join(CUPS_MODEL_DIR, "80mmSeries.ppd")
+            shutil.copy2(LOCAL_PPD, ppd_dest)
+            actions.append(f"Installed PPD: {ppd_dest}")
+            log.info("Installed thermal PPD: %s -> %s", LOCAL_PPD, ppd_dest)
+
+            # Patch FullCut default to PartialCut
+            try:
+                with open(ppd_dest, "r") as fh:
+                    ppd_content = fh.read()
+                patched = ppd_content.replace(
+                    "*DefaultFullCut: True", "*DefaultFullCut: False"
+                )
+                patched = patched.replace(
+                    "*DefaultFullCut: full", "*DefaultFullCut: partial"
+                )
+                patched = patched.replace(
+                    "*DefaultDocumentCut: True", "*DefaultDocumentCut: False"
+                )
+                if patched != ppd_content:
+                    with open(ppd_dest, "w") as fh:
+                        fh.write(patched)
+                    actions.append("Patched PPD: FullCut -> PartialCut default")
+            except Exception as exc:
+                log.debug("PPD patch failed (non-fatal): %s", exc)
+        except Exception as exc:
+            actions.append(f"Failed to install PPD: {exc}")
+            log.error("Failed to install PPD: %s", exc)
+    else:
+        log.debug("Local PPD not found: %s", LOCAL_PPD)
+
+    return actions
+
+
 def _install_sprt(params=None) -> dict:
-    """Install SPRT thermal printer driver and set up the printer."""
+    """Install SPRT thermal printer driver and set up the printer.
+    Strategy:
+      1. Try local driver files from /opt/it-aman/drivers/ (fastest, always works)
+      2. Fallback: download from Dropbox (old method)
+    """
     if params is None:
         params = {}
     report = {"status": "ok", "actions": [], "brand": "sprt"}
 
-    # Check if there's a specific USB URI from the thermal wizard detection
     requested_usb_uri = params.get("usb_uri", "").strip()
 
     # Remove existing printer first
@@ -1296,177 +1380,105 @@ def _install_sprt(params=None) -> dict:
         run_cmd(["lpadmin", "-x", SPRT_PRINTER_NAME])
         report["actions"].append(f"Removed existing printer '{SPRT_PRINTER_NAME}'")
 
-    tmp_dir = tempfile.mkdtemp(prefix="sprt_")
-    try:
-        # Download the driver zip
-        zip_path = os.path.join(tmp_dir, "sprt_driver.zip")
-        if not download_file(SPRT_DRIVER_URL, zip_path, "SPRT driver zip"):
-            return {"status": "error", "message": "Failed to download SPRT driver"}
+    # Step 1: Install local driver files (from /opt/it-aman/drivers/)
+    local_actions = _install_local_drivers()
+    report["actions"].extend(local_actions)
 
-        # Extract
-        extract_dir = os.path.join(tmp_dir, "sprt_extracted")
+    # If no local files found, fallback to downloading from Dropbox
+    if not local_actions:
+        log.info("No local driver files found, downloading from Dropbox")
+        tmp_dir = tempfile.mkdtemp(prefix="sprt_")
         try:
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                zf.extractall(extract_dir)
-            report["actions"].append("Extracted SPRT driver archive")
-        except zipfile.BadZipFile:
-            # The Dropbox download might not be a zip -- try running it directly
-            os.chmod(zip_path, 0o755)
-            rc, out, err = run_cmd(["bash", zip_path], timeout=120)
-            report["actions"].append(f"Ran downloaded file directly: rc={rc}")
-            extract_dir = tmp_dir
+            zip_path = os.path.join(tmp_dir, "sprt_driver.zip")
+            if not download_file(SPRT_DRIVER_URL, zip_path, "SPRT driver zip"):
+                return {"status": "error", "message": "Failed to download SPRT driver and no local files found"}
 
-        # Find and run install.sh
-        install_sh = None
-        for root, dirs, files in os.walk(extract_dir):
-            for f in files:
-                if f.lower() == "install.sh":
-                    install_sh = os.path.join(root, f)
-                    break
-            if install_sh:
-                break
+            try:
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    zf.extractall(os.path.join(tmp_dir, "sprt_extracted"))
+                report["actions"].append("Extracted SPRT driver archive")
+            except zipfile.BadZipFile:
+                os.chmod(zip_path, 0o755)
+                rc, out, err = run_cmd(["bash", zip_path], timeout=120)
+                report["actions"].append(f"Ran downloaded file directly: rc={rc}")
 
-        if install_sh:
-            os.chmod(install_sh, 0o755)
-            rc, out, err = run_cmd(["bash", install_sh], timeout=120)
-            if rc == 0:
-                report["actions"].append("install.sh ran successfully")
-            else:
-                report["actions"].append(f"install.sh returned {rc}: {err}")
-                log.warning("install.sh exit code %d: %s", rc, err)
-        else:
-            report["actions"].append("No install.sh found -- continuing manually")
-            log.warning("No install.sh found in SPRT driver archive")
-
-        # Copy rastertoprinter filter if present
-        for root, dirs, files in os.walk(extract_dir):
-            for f in files:
-                if "rastertoprinter" in f.lower():
-                    src = os.path.join(root, f)
-                    dst = "/usr/lib/cups/filter/rastertoprinter"
-                    try:
-                        shutil.copy2(src, dst)
-                        os.chmod(dst, 0o755)
-                        report["actions"].append(f"Copied filter: {src} -> {dst}")
-                    except Exception as exc:
-                        report["actions"].append(f"Failed to copy filter: {exc}")
-                    break
-
-        # Find the PPD file
-        ppd_src = None
-        for root, dirs, files in os.walk(extract_dir):
-            for f in files:
-                if f.endswith(".ppd") and "80mm" in f.lower():
-                    ppd_src = os.path.join(root, f)
-                    break
-            if ppd_src:
-                break
-
-        # If not found in archive, check if install.sh placed it
-        if not ppd_src and os.path.isfile(SPRT_PPD_DEST):
-            ppd_src = SPRT_PPD_DEST
-
-        # If still not found, do a broader search
-        if not ppd_src:
+            # Copy filters from extracted archive
+            extract_dir = os.path.join(tmp_dir, "sprt_extracted")
             for root, dirs, files in os.walk(extract_dir):
                 for f in files:
-                    if f.endswith(".ppd"):
-                        ppd_src = os.path.join(root, f)
+                    if "rastertoprinter" in f.lower():
+                        src = os.path.join(root, f)
+                        dst = os.path.join(CUPS_FILTER_DIR, f)
+                        try:
+                            shutil.copy2(src, dst)
+                            os.chmod(dst, 0o755)
+                            report["actions"].append(f"Copied filter: {dst}")
+                        except Exception as exc:
+                            report["actions"].append(f"Failed to copy filter: {exc}")
+
+            # Copy PPD from extracted archive
+            for root, dirs, files in os.walk(extract_dir):
+                for f in files:
+                    if f.endswith(".ppd") and "80mm" in f.lower():
+                        src = os.path.join(root, f)
+                        dst = os.path.join(CUPS_MODEL_DIR, "80mmSeries.ppd")
+                        try:
+                            os.makedirs(CUPS_MODEL_DIR, exist_ok=True)
+                            shutil.copy2(src, dst)
+                            report["actions"].append(f"Installed PPD: {dst}")
+                        except Exception as exc:
+                            report["actions"].append(f"Failed to copy PPD: {exc}")
                         break
-                if ppd_src:
-                    break
+        except Exception as exc:
+            log.error("SPRT download install error: %s", exc)
+            return {"status": "error", "message": str(exc)}
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
-        if ppd_src:
-            # Copy PPD to CUPS model directory
-            ppd_dir = os.path.dirname(SPRT_PPD_DEST)
-            os.makedirs(ppd_dir, exist_ok=True)
-            try:
-                shutil.copy2(ppd_src, SPRT_PPD_DEST)
-                report["actions"].append(f"Installed PPD: {SPRT_PPD_DEST}")
-            except Exception as exc:
-                report["actions"].append(f"Failed to copy PPD: {exc}")
+    # Restart CUPS to pick up new PPDs/filters
+    cups_restart()
 
-            # Patch FullCut default to PartialCut in PPD
-            try:
-                with open(SPRT_PPD_DEST, "r") as fh:
-                    ppd_content = fh.read()
-                # Replace FullCut default with PartialCut
-                patched = ppd_content.replace(
-                    "*DefaultFullCut: True",
-                    "*DefaultFullCut: False"
-                )
-                patched = patched.replace(
-                    "*DefaultFullCut: full",
-                    "*DefaultFullCut: partial"
-                )
-                # Also patch DocumentCut if present
-                patched = patched.replace(
-                    "*DefaultDocumentCut: True",
-                    "*DefaultDocumentCut: False"
-                )
-                if patched != ppd_content:
-                    with open(SPRT_PPD_DEST, "w") as fh:
-                        fh.write(patched)
-                    report["actions"].append("Patched PPD: FullCut -> PartialCut default")
-            except Exception as exc:
-                report["actions"].append(f"PPD patch failed (non-fatal): {exc}")
+    # Find USB URI
+    usb_uris = get_usb_uris()
+    if requested_usb_uri and requested_usb_uri in usb_uris:
+        usb_uri = requested_usb_uri
+        report["actions"].append(f"Using detected USB URI: {usb_uri}")
+    elif usb_uris:
+        usb_uri = usb_uris[0]
+        report["actions"].append(f"Found USB URI: {usb_uri}")
+    else:
+        report["actions"].append("No USB printer found -- will retry on plug-in")
+        usb_uri = "usb://SPRT/Printer"
 
-        # Restart CUPS to pick up new PPDs/filters
-        cups_restart()
-
-        # Find USB URI — prefer the one from wizard detection
-        usb_uris = get_usb_uris()
-        if requested_usb_uri and requested_usb_uri in usb_uris:
-            usb_uri = requested_usb_uri
-            report["actions"].append(f"Using detected USB URI: {usb_uri}")
-        elif usb_uris:
-            usb_uri = usb_uris[0]
-            report["actions"].append(f"Found USB URI: {usb_uri}")
+    # Set up printer with -P flag (direct PPD path)
+    ppd_path = os.path.join(CUPS_MODEL_DIR, "80mmSeries.ppd")
+    if os.path.isfile(ppd_path):
+        rc, _, err = run_cmd(
+            ["lpadmin", "-p", SPRT_PRINTER_NAME, "-E", "-v", usb_uri, "-P", ppd_path],
+            timeout=30,
+        )
+        if rc == 0:
+            report["actions"].append(f"Printer added with PPD: {ppd_path}")
         else:
-            report["actions"].append("No USB printer found -- will retry on plug-in")
-            usb_uri = "usb://SPRT/Printer"
-
-        # Set up printer with -P flag (direct PPD path)
-        if os.path.isfile(SPRT_PPD_DEST):
-            rc, _, err = run_cmd(
-                [
-                    "lpadmin", "-p", SPRT_PRINTER_NAME, "-E",
-                    "-v", usb_uri,
-                    "-P", SPRT_PPD_DEST,
-                ],
-                timeout=30,
-            )
-            if rc == 0:
-                report["actions"].append(f"Printer added with PPD: {SPRT_PPD_DEST}")
-            else:
-                report["actions"].append(f"lpadmin -P failed: {err}")
+            report["actions"].append(f"lpadmin -P failed: {err}")
+    else:
+        # Fallback: try -m everywhere
+        rc, _, err = run_cmd(
+            ["lpadmin", "-p", SPRT_PRINTER_NAME, "-E", "-v", usb_uri, "-m", "everywhere"],
+            timeout=30,
+        )
+        if rc == 0:
+            report["actions"].append("Printer added with IPP Everywhere (fallback)")
         else:
-            # Fallback: try -m everywhere
-            rc, _, err = run_cmd(
-                [
-                    "lpadmin", "-p", SPRT_PRINTER_NAME, "-E",
-                    "-v", usb_uri, "-m", "everywhere",
-                ],
-                timeout=30,
-            )
-            if rc == 0:
-                report["actions"].append("Printer added with IPP Everywhere (fallback)")
-            else:
-                report["actions"].append(f"All setup methods failed: {err}")
+            report["actions"].append(f"All setup methods failed: {err}")
 
-        # Enable, accept, set thermal defaults
-        run_cmd(["cupsenable", SPRT_PRINTER_NAME])
-        run_cmd(["cupsaccept", SPRT_PRINTER_NAME])
-        _set_thermal_cut_defaults(SPRT_PRINTER_NAME)
+    # Enable, accept, set thermal defaults
+    run_cmd(["cupsenable", SPRT_PRINTER_NAME])
+    run_cmd(["cupsaccept", SPRT_PRINTER_NAME])
+    _set_thermal_cut_defaults(SPRT_PRINTER_NAME)
 
-        report["actions"].append("SPRT printer setup complete")
-        return report
-
-    except Exception as exc:
-        log.error("SPRT install error: %s", exc)
-        return {"status": "error", "message": str(exc)}
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    report["actions"].append("SPRT printer setup complete")
+    return report
 
 
 # ---- handle_repair_printer (repair a SPECIFIC printer) --------------------

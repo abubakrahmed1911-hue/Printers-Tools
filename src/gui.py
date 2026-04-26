@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IT Aman Printer Support Tool v3.13 — GTK3 Frontend
+IT Aman Printer Support Tool v3.16 — GTK3 Frontend
 
 Communicates with it-aman daemon via Unix socket.
 Language is selected once at startup and locked for the session.
 No branch selection — works directly with network printers.
 Developed by IT Helpdesk Operation.
 
-Key changes in v3.13:
-  - NEW: Smart printer naming with auto-increment (Operation MF, Operation 2 MF, FS, FS2)
-  - NEW: Base name categories shown first in naming dialog, auto-suggest next available
-  - FIX: Window size reduced to 800x580 for smaller screens, resizable by user
-  - FIX: Printer lists now scrollable with minimum 3 printers visible at once
-  - FIX: More compact card layout for better density
-  - FIX: All daemon commands (repair, clean, status, quick fix) verified working
-  - FIX: Thermal printer detection and setup improved
-  - VERSION bumped to 3.13
+Key changes in v3.16 (lightweight GUI):
+  - FIX: Lightweight CSS — removed gradients, shadows, transitions for faster rendering
+  - FIX: Window default size reduced to 720x520 for smaller screens
+  - FIX: Proper delete-event handler ensures window always closes
+  - FIX: Printer result cards larger and more visible (bigger fonts, taller cards)
+  - FIX: Remove printer cards larger with bigger buttons
+  - FIX: Compact main menu, welcome screen, thermal wizard
+  - FIX: Simpler naming dialog (smaller, less modal blocking)
+  - VERSION bumped to 3.16
 """
 
 import gi
@@ -34,7 +34,7 @@ import re
 
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
 CONFIG_PATH = "/etc/it-aman/config.json"
-APP_VERSION = "3.15"
+APP_VERSION = "3.16"
 APP_NAME = "IT Aman - Printer Support Tool"
 DEVELOPER = "Developed by: IT Helpdesk Operation"
 
@@ -373,61 +373,59 @@ window {
 }
 
 .header-bar {
-    background: linear-gradient(135deg, @primary, @primary_dark);
+    background-color: @primary;
     color: white;
-    padding: 8px 16px;
-    border-radius: 0 0 8px 8px;
+    padding: 6px 12px;
+    border-radius: 0 0 4px 4px;
 }
 
 .header-bar .title-label {
     color: white;
-    font-size: 20px;
+    font-size: 18px;
     font-weight: bold;
 }
 
 .header-bar .subtitle-label {
     color: rgba(255,255,255,0.85);
-    font-size: 13px;
+    font-size: 12px;
 }
 
 .header-bar .dev-label {
     color: rgba(255,255,255,0.6);
-    font-size: 11px;
+    font-size: 10px;
 }
 
 .update-banner {
-    background: linear-gradient(135deg, #FFF3E0, #FFE0B2);
-    border: 2px solid #FF9800;
-    border-radius: 8px;
-    padding: 8px 12px;
+    background-color: #FFF3E0;
+    border: 1px solid #FF9800;
+    border-radius: 4px;
+    padding: 6px 10px;
 }
 
 .update-banner label {
     color: #E65100;
     font-weight: bold;
-    font-size: 13px;
+    font-size: 12px;
 }
 
 .card {
     background-color: @card_bg;
-    border-radius: 12px;
-    padding: 18px;
-    margin: 6px;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    border-radius: 4px;
+    padding: 12px;
+    margin: 4px;
+    border: 1px solid #E0E0E0;
 }
 
 .card-clickable {
     background-color: @card_bg;
-    border-radius: 8px;
-    padding: 10px;
-    margin: 3px;
-    box-shadow: 0 1px 4px rgba(0,0,0,0.06);
-    transition: all 100ms ease;
+    border-radius: 4px;
+    padding: 8px;
+    margin: 2px;
+    border: 1px solid #E0E0E0;
 }
 
 .card-clickable:hover {
     background-color: #E3F2FD;
-    box-shadow: 0 4px 16px rgba(0,0,0,0.14);
 }
 
 .card-clickable:active {
@@ -435,50 +433,48 @@ window {
 }
 
 .card-title {
-    font-size: 16px;
+    font-size: 14px;
     font-weight: bold;
     color: @text_primary;
 }
 
 .card-desc {
-    font-size: 13px;
+    font-size: 12px;
     color: @text_secondary;
-    margin-top: 4px;
+    margin-top: 2px;
 }
 
 .card-icon {
-    font-size: 32px;
+    font-size: 24px;
     color: @primary;
 }
 
 .btn-primary {
-    background: linear-gradient(135deg, @primary, @primary_dark);
+    background-color: @primary;
     color: white;
-    border-radius: 8px;
-    padding: 10px 28px;
+    border-radius: 4px;
+    padding: 8px 20px;
     font-weight: bold;
-    font-size: 14px;
+    font-size: 13px;
     border: none;
-    box-shadow: 0 2px 6px rgba(33,150,243,0.3);
 }
 
 .btn-primary:hover {
-    background: linear-gradient(135deg, @primary_dark, #1565C0);
+    background-color: @primary_dark;
 }
 
 .btn-primary:disabled {
     background: #BDBDBD;
-    box-shadow: none;
 }
 
 .btn-secondary {
     background-color: white;
     color: @primary;
-    border: 2px solid @primary;
-    border-radius: 8px;
-    padding: 8px 24px;
+    border: 1px solid @primary;
+    border-radius: 4px;
+    padding: 6px 16px;
     font-weight: bold;
-    font-size: 14px;
+    font-size: 13px;
 }
 
 .btn-secondary:hover {
@@ -486,74 +482,71 @@ window {
 }
 
 .btn-danger {
-    background: linear-gradient(135deg, @error_color, #D32F2F);
+    background-color: @error_color;
     color: white;
-    border-radius: 8px;
-    padding: 10px 28px;
+    border-radius: 4px;
+    padding: 8px 20px;
     font-weight: bold;
-    font-size: 14px;
+    font-size: 13px;
     border: none;
 }
 
 .btn-danger:hover {
-    background: linear-gradient(135deg, #D32F2F, #B71C1C);
+    background-color: #D32F2F;
 }
 
 .btn-success {
-    background: linear-gradient(135deg, @success, #388E3C);
+    background-color: @success;
     color: white;
-    border-radius: 8px;
-    padding: 10px 28px;
+    border-radius: 4px;
+    padding: 8px 20px;
     font-weight: bold;
-    font-size: 14px;
+    font-size: 13px;
     border: none;
 }
 
 .btn-warning {
-    background: linear-gradient(135deg, @warning_color, #F57C00);
+    background-color: @warning_color;
     color: white;
-    border-radius: 8px;
-    padding: 10px 28px;
+    border-radius: 4px;
+    padding: 8px 20px;
     font-weight: bold;
-    font-size: 14px;
+    font-size: 13px;
     border: none;
 }
 
 .lang-card {
     background-color: @card_bg;
-    border-radius: 16px;
-    padding: 32px 24px;
-    margin: 8px;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-    transition: all 200ms ease;
-    border: 3px solid transparent;
+    border-radius: 4px;
+    padding: 16px 12px;
+    margin: 4px;
+    border: 2px solid transparent;
 }
 
 .lang-card:hover {
-    box-shadow: 0 6px 20px rgba(33,150,243,0.25);
     border-color: @primary;
 }
 
 .lang-card.selected {
     background-color: @primary_light;
     border-color: @primary;
-    border-width: 3px;
+    border-width: 2px;
 }
 
 .progress-bar trough {
-    border-radius: 6px;
+    border-radius: 3px;
     background-color: #E0E0E0;
-    min-height: 10px;
+    min-height: 8px;
 }
 
 .progress-bar progress {
-    border-radius: 6px;
-    background: linear-gradient(90deg, @primary, @primary_dark);
-    min-height: 10px;
+    border-radius: 3px;
+    background-color: @primary;
+    min-height: 8px;
 }
 
 .step-indicator {
-    font-size: 14px;
+    font-size: 13px;
     color: @primary;
     font-weight: bold;
 }
@@ -570,26 +563,22 @@ window {
 
 .printer-result-card {
     background-color: @card_bg;
-    border-radius: 8px;
-    padding: 8px 12px;
+    border-radius: 4px;
+    padding: 10px 14px;
     margin: 3px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
     border-left: 3px solid @primary;
 }
 
 .brand-card {
     background-color: @card_bg;
-    border-radius: 16px;
-    padding: 24px;
-    margin: 10px;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-    border: 3px solid transparent;
-    transition: all 200ms ease;
+    border-radius: 4px;
+    padding: 16px;
+    margin: 6px;
+    border: 2px solid transparent;
 }
 
 .brand-card:hover {
     border-color: @primary;
-    box-shadow: 0 4px 16px rgba(33,150,243,0.2);
 }
 
 .brand-card.selected {
@@ -602,8 +591,8 @@ window {
 }
 
 .wizard-content {
-    padding: 24px;
-    min-height: 300px;
+    padding: 16px;
+    min-height: 250px;
 }
 """
 
@@ -786,11 +775,11 @@ class WelcomeScreen(Gtk.Box):
     def _make_lang_card(self, text, icon_name, lang_id):
         btn = Gtk.Button()
         btn.get_style_context().add_class("lang-card")
-        btn.set_size_request(180, 140)
-        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        inner.set_margin_top(24)
-        inner.set_margin_bottom(24)
-        icon = Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.DIALOG)
+        btn.set_size_request(140, 100)
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        inner.set_margin_top(12)
+        inner.set_margin_bottom(12)
+        icon = Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.LARGE_TOOLBAR)
         lbl = Gtk.Label()
         lbl.set_markup(f"<span size='x-large' weight='bold'>{text}</span>")
         inner.pack_start(icon, False, False, 0)
@@ -871,15 +860,15 @@ class MainMenuScreen(Gtk.Box):
         btn = Gtk.Button()
         btn.get_style_context().add_class("card-clickable")
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        vbox.set_margin_top(12)
-        vbox.set_margin_bottom(12)
+        vbox.set_margin_top(6)
+        vbox.set_margin_bottom(6)
         vbox.set_halign(Gtk.Align.CENTER)
         vbox.set_valign(Gtk.Align.CENTER)
-        icon = Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.DIALOG)
+        icon = Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.LARGE_TOOLBAR)
         icon.get_style_context().add_class("card-icon")
         vbox.pack_start(icon, False, False, 0)
         title_lbl = Gtk.Label()
-        title_lbl.set_markup(f"<span weight='bold' size='medium'>{title}</span>")
+        title_lbl.set_markup(f"<span weight='bold' size='small'>{title}</span>")
         title_lbl.set_line_wrap(True)
         title_lbl.set_max_width_chars(20)
         title_lbl.set_justify(Gtk.Justification.CENTER)
@@ -1099,6 +1088,7 @@ class NetworkPrinterScreen(Gtk.Box):
 
         self.results_scroll = Gtk.ScrolledWindow()
         self.results_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.results_scroll.set_min_content_height(300)
         self.results_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.results_scroll.add(self.results_box)
         self.pack_start(self.results_scroll, True, True, 0)
@@ -1155,10 +1145,11 @@ class NetworkPrinterScreen(Gtk.Box):
 
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         card.get_style_context().add_class("printer-result-card")
+        card.set_size_request(-1, 60)
 
         model = prn.get("model", prn.get("name", "Unknown"))
         model_lbl = Gtk.Label()
-        model_lbl.set_markup(f"<span size='medium' weight='bold'>{model}</span>")
+        model_lbl.set_markup(f"<span size='large' weight='bold'>{model}</span>")
         model_lbl.set_xalign(xalign)
         card.pack_start(model_lbl, False, False, 0)
 
@@ -1166,7 +1157,7 @@ class NetworkPrinterScreen(Gtk.Box):
 
         ip = prn.get("ip", "N/A")
         ip_lbl = Gtk.Label()
-        ip_lbl.set_markup(f"<span size='small'>IP: <b>{ip}</b></span>")
+        ip_lbl.set_markup(f"<span size='medium'>IP: <b>{ip}</b></span>")
         details.pack_start(ip_lbl, False, False, 0)
 
         proto_raw = prn.get("protocol", "ipp-everywhere")
@@ -1187,7 +1178,7 @@ class NetworkPrinterScreen(Gtk.Box):
         add_btn = Gtk.Button(label=t("add", lang))
         add_btn.get_style_context().add_class("btn-success")
         add_btn.set_halign(Gtk.Align.END if lang != "ar" else Gtk.Align.START)
-        add_btn.set_size_request(100, 32)
+        add_btn.set_size_request(140, 44)
 
         # Build a safe printer name — fall back to model, then IP-based name
         printer_name = prn.get("name") or model or f"Printer-{ip}"
@@ -1242,7 +1233,7 @@ class NetworkPrinterScreen(Gtk.Box):
             parent=self.app,
             flags=Gtk.DialogFlags.MODAL,
         )
-        dialog.set_default_size(460, 520)
+        dialog.set_default_size(400, 440)
 
         content = dialog.get_content_area()
         content.set_spacing(8)
@@ -1261,7 +1252,7 @@ class NetworkPrinterScreen(Gtk.Box):
         # Scrolled list of names
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scrolled.set_min_content_height(280)  # Ensure at least 3-4 names visible
+        scrolled.set_min_content_height(200)  # Ensure at least 3-4 names visible
         list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         scrolled.add(list_box)
 
@@ -1436,6 +1427,7 @@ class NetworkPrinterScreen(Gtk.Box):
         self.remove_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_min_content_height(250)
         scrolled.add(self.remove_list)
         self.pack_start(scrolled, True, True, 0)
         self.show_all()
@@ -1476,6 +1468,7 @@ class NetworkPrinterScreen(Gtk.Box):
         for prn in printers:
             card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
             card.get_style_context().add_class("printer-result-card")
+            card.set_size_request(-1, 50)
             name = prn.get("name", "Unknown")
             name_lbl = Gtk.Label()
             name_lbl.set_markup(f"<span size='medium' weight='bold'>{name}</span>")
@@ -1483,7 +1476,7 @@ class NetworkPrinterScreen(Gtk.Box):
 
             rm_btn = Gtk.Button(label=t("remove", lang))
             rm_btn.get_style_context().add_class("btn-danger")
-            rm_btn.set_size_request(100, 36)
+            rm_btn.set_size_request(120, 40)
 
             def _remove(btn, pname=name):
                 dialog = Gtk.MessageDialog(
@@ -1711,11 +1704,11 @@ class ThermalPrinterScreen(Gtk.Box):
     def _brand_card(self, icon_name, name, desc, brand_id):
         btn = Gtk.Button()
         btn.get_style_context().add_class("brand-card")
-        btn.set_size_request(200, 200)
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        btn.set_size_request(160, 150)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         vbox.set_valign(Gtk.Align.CENTER)
-        icon = Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.DIALOG)
-        icon.set_pixel_size(64)
+        icon = Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.LARGE_TOOLBAR)
+        icon.set_pixel_size(48)
         icon.get_style_context().add_class("card-icon")
         vbox.pack_start(icon, False, False, 0)
         name_lbl = Gtk.Label()
@@ -1958,6 +1951,7 @@ class ThermalPrinterScreen(Gtk.Box):
         for prn in printers:
             card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
             card.get_style_context().add_class("printer-result-card")
+            card.set_size_request(-1, 50)
             name = prn.get("name", "Unknown")
             name_lbl = Gtk.Label()
             name_lbl.set_markup(f"<span size='medium' weight='bold'>{name}</span>")
@@ -1965,7 +1959,7 @@ class ThermalPrinterScreen(Gtk.Box):
 
             rm_btn = Gtk.Button(label=t("remove", lang))
             rm_btn.get_style_context().add_class("btn-danger")
-            rm_btn.set_size_request(100, 36)
+            rm_btn.set_size_request(120, 40)
 
             def _do_remove(btn, pname=name):
                 dlg = Gtk.MessageDialog(
@@ -2493,12 +2487,12 @@ class ITAmanApp(Gtk.Window):
             monitor = display.get_primary_monitor()
             if monitor:
                 geom = monitor.get_geometry()
-                # Smaller default: 55% width (max 800), 60% height (max 580)
-                w = min(int(geom.width * 0.55), 800)
-                h = min(int(geom.height * 0.60), 580)
+                # Lightweight default: 50% width (max 720), 55% height (max 520)
+                w = min(int(geom.width * 0.50), 720)
+                h = min(int(geom.height * 0.55), 520)
                 self.set_default_size(w, h)
             else:
-                self.set_default_size(800, 580)
+                self.set_default_size(720, 520)
         else:
             self.set_default_size(720, 520)
 
@@ -2506,6 +2500,8 @@ class ITAmanApp(Gtk.Window):
         self.set_resizable(True)
         # Allow easy closing with Escape key
         self.connect("key-press-event", self._on_key_press)
+        # Ensure window always closes properly
+        self.connect("delete-event", self._on_delete_event)
 
         if os.path.exists(ICON_PATH):
             try:
@@ -2571,6 +2567,14 @@ class ITAmanApp(Gtk.Window):
         if event.keyval == Gdk.KEY_Escape:
             self.destroy()
             return True
+        return False
+
+    def _on_delete_event(self, widget, event):
+        """Always allow window close."""
+        try:
+            Gtk.main_quit()
+        except Exception:
+            pass
         return False
 
     def set_header(self, title, subtitle=""):
