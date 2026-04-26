@@ -48,7 +48,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "3.5"
+VERSION = "3.6"
 
 # Paths
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
@@ -92,6 +92,10 @@ MODEL_PROBE_TIMEOUT = 5           # seconds for HTTP model probe
 
 # Socket buffer
 SOCKET_RECV_BUF = 65536
+
+# Auto-update settings
+AUTO_UPDATE_INTERVAL = 60       # seconds between checks (1 minute)
+AUTO_UPDATE_ENABLED = True      # set to False to disable background auto-update
 
 # Allowed commands whitelist — anything not listed is rejected
 ALLOWED_COMMANDS = {
@@ -2167,6 +2171,72 @@ def preflight_checks():
 # Main entry point
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Auto-update background checker
+# ---------------------------------------------------------------------------
+
+_auto_update_stop = threading.Event()
+
+
+def _auto_update_loop():
+    """
+    Background thread that periodically checks GitHub for updates.
+    When a newer version is found, it automatically calls handle_update_all
+    which downloads, verifies (Ed25519), and applies the update — then
+    the daemon restarts itself.
+
+    The check interval is controlled by AUTO_UPDATE_INTERVAL (default 60s).
+    Set AUTO_UPDATE_ENABLED = False to disable.
+    """
+    log.info("Auto-update loop started — checking every %d seconds", AUTO_UPDATE_INTERVAL)
+
+    # Wait a bit on first start so the daemon settles before checking
+    _auto_update_stop.wait(30)
+
+    while not _auto_update_stop.is_set():
+        try:
+            version_url = f"{RAW_BASE}/version.json"
+            version_text = download_text(version_url, timeout=15)
+
+            if version_text:
+                try:
+                    remote_info = json.loads(version_text)
+                    remote_version = remote_info.get("version", "")
+
+                    if remote_version and _compare_versions(remote_version, VERSION) > 0:
+                        log.info(
+                            "Auto-update: new version detected! %s -> %s. Applying update...",
+                            VERSION, remote_version,
+                        )
+                        # Call handle_update_all to download, verify, and apply
+                        result = handle_update_all({})
+                        if result.get("status") == "ok":
+                            log.info("Auto-update applied successfully: %s", result.get("actions", []))
+                            # handle_update_all schedules a restart, so we'll exit
+                            return
+                        else:
+                            log.warning("Auto-update failed: %s", result.get("message", "unknown error"))
+                    else:
+                        log.debug("Auto-update: already up to date (local=%s, remote=%s)", VERSION, remote_version)
+
+                except json.JSONDecodeError:
+                    log.debug("Auto-update: invalid version.json from GitHub")
+            else:
+                log.debug("Auto-update: could not reach GitHub")
+
+        except Exception as exc:
+            log.debug("Auto-update check error (non-fatal): %s", exc)
+
+        # Wait for the next check interval (or stop signal)
+        _auto_update_stop.wait(AUTO_UPDATE_INTERVAL)
+
+
+def start_auto_update_checker():
+    """Start the auto-update background thread."""
+    t = threading.Thread(target=_auto_update_loop, daemon=True, name="auto-update")
+    t.start()
+
+
 def main():
     """Main entry point for the IT Aman Printer Daemon."""
     import argparse
@@ -2204,6 +2274,13 @@ def main():
         for handler in log.handlers:
             if isinstance(handler, logging.StreamHandler):
                 handler.setLevel(logging.DEBUG)
+
+    # Start the auto-update background checker
+    if AUTO_UPDATE_ENABLED:
+        start_auto_update_checker()
+        log.info("Auto-update checker started (interval: %ds)", AUTO_UPDATE_INTERVAL)
+    else:
+        log.info("Auto-update checker disabled")
 
     # Start the socket server (blocking)
     try:
