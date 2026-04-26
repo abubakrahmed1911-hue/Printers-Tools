@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IT Aman Printer Support Tool v3.11 — GTK3 Frontend
+IT Aman Printer Support Tool v3.12 — GTK3 Frontend
 
 Communicates with it-aman daemon via Unix socket.
 Language is selected once at startup and locked for the session.
 No branch selection — works directly with network printers.
 Developed by IT Helpdesk Operation.
 
-Key fixes in v3.11:
-  - CRITICAL FIX: pulse_loop timer leak causing GUI freeze (was creating
-    new GLib.timeout_add each cycle instead of returning True for auto-repeat)
-  - CRITICAL FIX: Network printer card now passes URI when IP is missing,
-    so printers without a direct IP can still be added
-  - CRITICAL FIX: Printer name defaults to model or IP-based name instead
-    of "Unknown" which would fail lpadmin
-  - FIX: Increased timeouts for network scan and driver installation
-  - FIX: USB detection result timeout added
-  - VERSION bumped to 3.11
+Key changes in v3.12:
+  - NEW: Printer naming system with predefined templates (Operation MF, Accountant MF, FS, etc.)
+  - NEW: Centralized definition sync from GitHub
+  - FIX: Reduced window size for better usability on smaller screens
+  - FIX: More compact card layout showing more printers
+  - FIX: Printer name selection dialog before adding network printers
+  - FIX: Thermal printer screen with better driver selection
+  - VERSION bumped to 3.12
 """
 
 import gi
@@ -29,12 +27,13 @@ import threading
 import os
 import sys
 import subprocess
+import re
 
 # ──────────────────────────── Constants ────────────────────────────
 
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
 CONFIG_PATH = "/etc/it-aman/config.json"
-APP_VERSION = "3.11"
+APP_VERSION = "3.12"
 APP_NAME = "IT Aman - Printer Support Tool"
 DEVELOPER = "Developed by: IT Helpdesk Operation"
 
@@ -186,6 +185,18 @@ TRANSLATIONS = {
         "update_up_to_date": "أنت تستخدم أحدث إصدار",
         "warning": "تحذير",
         "info": "معلومات",
+        "naming_title": "اختر اسم الطابعة",
+        "naming_select": "اختر اسم للطابعة من القائمة أو اكتب اسم مخصص:",
+        "naming_custom": "اسم مخصص:",
+        "naming_taken": "هذا الاسم مستخدم بالفعل",
+        "naming_apply": "تطبيق",
+        "sync_title": "مزامنة التعريفات",
+        "sync_desc": "تحميل وتطبيق التعريفات المركزية من الخادم",
+        "sync_done": "تمت مزامنة التعريفات بنجاح!",
+        "sync_fail": "فشلت مزامنة التعريفات",
+        "sync_btn": "مزامنة التعريفات",
+        "thermal_driver": "تعريف حراري",
+        "thermal_driver_desc": "تثبيت تعريف الطابعة الحرارية",
     },
     "en": {
         "welcome_title": "IT Aman — Printer Support Tool",
@@ -324,6 +335,18 @@ TRANSLATIONS = {
         "update_up_to_date": "You are running the latest version",
         "warning": "Warning",
         "info": "Info",
+        "naming_title": "Choose Printer Name",
+        "naming_select": "Select a name for the printer from the list or type a custom name:",
+        "naming_custom": "Custom name:",
+        "naming_taken": "This name is already taken",
+        "naming_apply": "Apply",
+        "sync_title": "Sync Definitions",
+        "sync_desc": "Download and apply centralized definitions from server",
+        "sync_done": "Definitions synced successfully!",
+        "sync_fail": "Failed to sync definitions",
+        "sync_btn": "Sync Definitions",
+        "thermal_driver": "Thermal Driver",
+        "thermal_driver_desc": "Install thermal printer driver",
     }
 }
 
@@ -1123,45 +1146,45 @@ class NetworkPrinterScreen(Gtk.Box):
             pass
 
     def _printer_card(self, prn):
-        """Create a result card for a discovered network printer."""
+        """Create a compact result card for a discovered network printer."""
         lang = self.app.lang
         xalign = 0.0 if lang != "ar" else 1.0
 
-        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         card.get_style_context().add_class("printer-result-card")
 
         model = prn.get("model", prn.get("name", "Unknown"))
         model_lbl = Gtk.Label()
-        model_lbl.set_markup(f"<span size='x-large' weight='bold'>{model}</span>")
+        model_lbl.set_markup(f"<span size='medium' weight='bold'>{model}</span>")
         model_lbl.set_xalign(xalign)
         card.pack_start(model_lbl, False, False, 0)
 
-        details = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        details = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
 
         ip = prn.get("ip", "N/A")
         ip_lbl = Gtk.Label()
-        ip_lbl.set_markup(f"<span size='medium'>IP: <b>{ip}</b></span>")
+        ip_lbl.set_markup(f"<span size='small'>IP: <b>{ip}</b></span>")
         details.pack_start(ip_lbl, False, False, 0)
 
         proto_raw = prn.get("protocol", "ipp-everywhere")
         proto = t("net_ipp", lang) if "ipp" in proto_raw.lower() else t("net_lpd", lang)
         proto_lbl = Gtk.Label()
-        proto_lbl.set_markup(f"<span size='medium'>{t('net_protocol', lang)}: <b>{proto}</b></span>")
+        proto_lbl.set_markup(f"<span size='small'>{t('net_protocol', lang)}: <b>{proto}</b></span>")
         details.pack_start(proto_lbl, False, False, 0)
 
         needs_driver = prn.get("needs_driver", False)
         drv_txt = t("net_driver_needed", lang) if needs_driver else t("net_no_driver", lang)
         drv_clr = "#FF9800" if needs_driver else "#4CAF50"
         drv_lbl = Gtk.Label()
-        drv_lbl.set_markup(f"<span size='medium' color='{drv_clr}'>{drv_txt}</span>")
+        drv_lbl.set_markup(f"<span size='small' color='{drv_clr}'>{drv_txt}</span>")
         details.pack_start(drv_lbl, False, False, 0)
 
-        card.pack_start(details, False, False, 4)
+        card.pack_start(details, False, False, 2)
 
         add_btn = Gtk.Button(label=t("add", lang))
         add_btn.get_style_context().add_class("btn-success")
         add_btn.set_halign(Gtk.Align.END if lang != "ar" else Gtk.Align.START)
-        add_btn.set_size_request(120, 36)
+        add_btn.set_size_request(100, 32)
 
         # Build a safe printer name — fall back to model, then IP-based name
         printer_name = prn.get("name") or model or f"Printer-{ip}"
@@ -1179,38 +1202,171 @@ class NetworkPrinterScreen(Gtk.Box):
         )
 
         def _add(btn, data=printer_data):
-            btn.set_sensitive(False)
-            btn.set_label(t("installing", lang))
-
-            def on_result(res):
-                if res.get("status") == "ok":
-                    btn.set_label(f"\u2713 {t('success', lang)}")
-                else:
-                    btn.set_label(t("retry", lang))
-                    btn.set_sensitive(True)
-                    self.app.show_error(res.get("message", t("error", lang)))
-
-            # Build the command with safe values — use uri if ip missing
-            cmd = {
-                "action": "add_network_printer",
-                "name": data["name"],
-                "model": data.get("model", ""),
-            }
-            if data.get("ip"):
-                cmd["ip"] = data["ip"]
-            elif data.get("uri"):
-                cmd["uri"] = data["uri"]
-            else:
-                self.app.show_error(t("error", lang))
-                btn.set_sensitive(True)
-                btn.set_label(t("add", lang))
-                return
-
-            self.app.daemon.send_threaded(cmd, on_result, timeout=60)
+            # Show naming dialog first
+            self._show_naming_dialog(data, btn)
 
         add_btn.connect("clicked", _add)
         card.pack_start(add_btn, False, False, 0)
         return card
+
+    def _show_naming_dialog(self, printer_data, add_btn):
+        """Show a dialog for the user to select a printer name from templates."""
+        lang = self.app.lang
+
+        # Fetch name templates from daemon
+        self.app.daemon.send_threaded(
+            {"action": "get_name_templates"},
+            lambda result: self._on_templates_result(result, printer_data, add_btn),
+            timeout=15,
+        )
+
+    def _on_templates_result(self, result, printer_data, add_btn):
+        """Called when name templates are received from daemon."""
+        lang = self.app.lang
+
+        if result.get("status") != "ok":
+            # Fallback: just use the default name
+            self._do_add_printer(printer_data, add_btn)
+            return
+
+        templates = result.get("templates", [])
+        installed = result.get("installed", [])
+
+        dialog = Gtk.Dialog(
+            title=t("naming_title", lang),
+            parent=self.app,
+            flags=Gtk.DialogFlags.MODAL,
+        )
+        dialog.set_default_size(420, 480)
+
+        content = dialog.get_content_area()
+        content.set_spacing(8)
+        content.set_margin_top(12)
+        content.set_margin_bottom(12)
+        content.set_margin_start(12)
+        content.set_margin_end(12)
+
+        # Instruction label
+        instr = Gtk.Label()
+        instr.set_markup(f"<span weight='bold'>{t('naming_select', lang)}</span>")
+        instr.set_line_wrap(True)
+        instr.set_xalign(0.0 if lang != "ar" else 1.0)
+        content.pack_start(instr, False, False, 0)
+
+        # Scrolled list of template names
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        scrolled.add(list_box)
+
+        selected_name = [None]  # mutable container for closure
+
+        for tmpl in templates:
+            # Sanitize template name for CUPS compatibility
+            safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', tmpl)
+            is_taken = safe_name in installed
+
+            row = Gtk.Button()
+            row.get_style_context().add_class("card-clickable")
+            row.set_size_request(-1, 36)
+
+            lbl_text = tmpl
+            if is_taken:
+                lbl_text += f"  ({t('status_enabled', lang)})"
+
+            lbl = Gtk.Label()
+            clr = '#757575' if is_taken else '#212121'
+            lbl.set_markup(f"<span color='{clr}'>{lbl_text}</span>")
+            lbl.set_xalign(0.0 if lang != "ar" else 1.0)
+            row.add(lbl)
+
+            def _select(btn, name=safe_name, orig=tmpl, taken=is_taken):
+                if not taken:
+                    selected_name[0] = name
+                    # Highlight selected
+                    for child in list_box.get_children():
+                        child.get_style_context().remove_class("selected")
+                    btn.get_style_context().add_class("selected")
+
+            row.connect("clicked", _select)
+            list_box.pack_start(row, False, False, 0)
+
+        content.pack_start(scrolled, True, True, 4)
+
+        # Custom name entry
+        custom_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        custom_lbl = Gtk.Label(label=t("naming_custom", lang))
+        custom_box.pack_start(custom_lbl, False, False, 0)
+        custom_entry = Gtk.Entry()
+        custom_entry.set_placeholder_text("Operation MF")
+        custom_entry.connect("changed", lambda e: selected_name.__setitem__(0, re.sub(r'[^a-zA-Z0-9_-]', '_', e.get_text().strip()) if e.get_text().strip() else None))
+        custom_box.pack_start(custom_entry, True, True, 0)
+        content.pack_start(custom_box, False, False, 4)
+
+        # Buttons
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_box.set_halign(Gtk.Align.CENTER)
+
+        apply_btn = Gtk.Button(label=t("naming_apply", lang))
+        apply_btn.get_style_context().add_class("btn-primary")
+        apply_btn.set_size_request(120, 36)
+
+        cancel_btn = Gtk.Button(label=t("cancel", lang))
+        cancel_btn.get_style_context().add_class("btn-secondary")
+        cancel_btn.set_size_request(100, 36)
+
+        def _apply(btn):
+            name = selected_name[0]
+            if not name:
+                return
+            dialog.response(Gtk.ResponseType.OK)
+            # Override the printer name
+            printer_data["name"] = name
+            self._do_add_printer(printer_data, add_btn)
+
+        def _cancel(btn):
+            dialog.response(Gtk.ResponseType.CANCEL)
+
+        apply_btn.connect("clicked", _apply)
+        cancel_btn.connect("clicked", _cancel)
+        btn_box.pack_start(apply_btn, False, False, 0)
+        btn_box.pack_start(cancel_btn, False, False, 0)
+        content.pack_start(btn_box, False, False, 8)
+
+        content.show_all()
+        dialog.run()
+        dialog.destroy()
+
+    def _do_add_printer(self, data, add_btn):
+        """Actually add the printer with the selected name."""
+        lang = self.app.lang
+        add_btn.set_sensitive(False)
+        add_btn.set_label(t("installing", lang))
+
+        def on_result(res):
+            if res.get("status") == "ok":
+                add_btn.set_label(f"\u2713 {t('success', lang)}")
+            else:
+                add_btn.set_label(t("retry", lang))
+                add_btn.set_sensitive(True)
+                self.app.show_error(res.get("message", t("error", lang)))
+
+        cmd = {
+            "action": "add_network_printer",
+            "name": data["name"],
+            "model": data.get("model", ""),
+        }
+        if data.get("ip"):
+            cmd["ip"] = data["ip"]
+        elif data.get("uri"):
+            cmd["uri"] = data["uri"]
+        else:
+            self.app.show_error(t("error", lang))
+            add_btn.set_sensitive(True)
+            add_btn.set_label(t("add", lang))
+            return
+
+        self.app.daemon.send_threaded(cmd, on_result, timeout=60)
 
     # ── Remove sub-screen ──
 
@@ -1808,7 +1964,7 @@ class ThermalPrinterScreen(Gtk.Box):
 # ──────────────────────────── Screen: Repair ────────────────────────────
 
 class RepairScreen(Gtk.Box):
-    """Select a printer → enable + clear jobs."""
+    """Select a printer → enable + clear jobs + clean."""
 
     def __init__(self, app):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
@@ -1879,38 +2035,32 @@ class RepairScreen(Gtk.Box):
             return
 
         for prn in printers:
-            card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             card.get_style_context().add_class("printer-result-card")
             name = prn.get("name", "Unknown")
             state = prn.get("state", "unknown")
 
-            info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
             name_lbl = Gtk.Label()
-            name_lbl.set_markup(f"<span size='medium' weight='bold'>{name}</span>")
+            name_lbl.set_markup(f"<span size='small' weight='bold'>{name}</span>")
             name_lbl.set_xalign(0.0 if lang != "ar" else 1.0)
             info.pack_start(name_lbl, False, False, 0)
 
-            # Show state for ALL printers, not just disabled
-            if state in ("disabled", "stopped"):
-                state_lbl = Gtk.Label()
-                state_lbl.set_markup(
-                    f"<span color='#F44336'>{t('status_disabled', lang)}</span>"
-                )
-                state_lbl.set_xalign(0.0 if lang != "ar" else 1.0)
-                info.pack_start(state_lbl, False, False, 0)
-            elif state in ("enabled", "idle", "processing"):
-                state_lbl = Gtk.Label()
-                state_lbl.set_markup(
-                    f"<span color='#4CAF50'>{t('status_enabled', lang)}</span>"
-                )
-                state_lbl.set_xalign(0.0 if lang != "ar" else 1.0)
-                info.pack_start(state_lbl, False, False, 0)
+            # Show state for ALL printers
+            state_txt = t('status_disabled', lang) if state in ("disabled", "stopped") else t('status_enabled', lang)
+            state_clr = '#F44336' if state in ("disabled", "stopped") else '#4CAF50'
+            state_lbl = Gtk.Label()
+            state_lbl.set_markup(f"<span size='small' color='{state_clr}'>{state_txt}</span>")
+            state_lbl.set_xalign(0.0 if lang != "ar" else 1.0)
+            info.pack_start(state_lbl, False, False, 0)
 
-            # Show device URI
+            # Show device URI (compact)
             device = prn.get("device", "")
+            if device and len(device) > 50:
+                device = device[:47] + "..."
             if device:
                 dev_lbl = Gtk.Label()
-                dev_lbl.set_markup(f"<span size='small' color='#757575'>{device}</span>")
+                dev_lbl.set_markup(f"<span size='x-small' color='#757575'>{device}</span>")
                 dev_lbl.set_xalign(0.0 if lang != "ar" else 1.0)
                 info.pack_start(dev_lbl, False, False, 0)
 
@@ -1918,7 +2068,7 @@ class RepairScreen(Gtk.Box):
 
             fix_btn = Gtk.Button(label=t("menu_repair", lang))
             fix_btn.get_style_context().add_class("btn-primary")
-            fix_btn.set_size_request(120, 36)
+            fix_btn.set_size_request(100, 30)
 
             def _fix(btn, pname=name):
                 btn.set_sensitive(False)
@@ -1931,7 +2081,6 @@ class RepairScreen(Gtk.Box):
                     except Exception:
                         pass
                     if res.get("status") == "ok":
-                        # Show all actions from the repair
                         actions = res.get("actions", [])
                         if actions:
                             self.status_lbl.set_markup(
@@ -1944,7 +2093,7 @@ class RepairScreen(Gtk.Box):
                                 f"<span color='#4CAF50' weight='bold'>"
                                 f"{t('repair_done', lang)}</span>"
                             )
-                        btn.set_label(f"✓ {t('done', lang)}")
+                        btn.set_label(f"\u2713 {t('done', lang)}")
                         btn.get_style_context().add_class("btn-success")
                     else:
                         self.status_lbl.set_markup(
@@ -1955,7 +2104,7 @@ class RepairScreen(Gtk.Box):
                         btn.set_sensitive(True)
 
                 self.app.daemon.send_threaded(
-                    {"action": "repair_printer", "name": pname}, on_res
+                    {"action": "repair_printer", "name": pname}, on_res, timeout=60
                 )
 
             fix_btn.connect("clicked", _fix)
@@ -2304,11 +2453,13 @@ class ITAmanApp(Gtk.Window):
             monitor = display.get_primary_monitor()
             if monitor:
                 geom = monitor.get_geometry()
-                self.set_default_size(int(geom.width * 0.85), int(geom.height * 0.85))
+                w = min(int(geom.width * 0.65), 900)
+                h = min(int(geom.height * 0.72), 680)
+                self.set_default_size(w, h)
             else:
-                self.set_default_size(1100, 750)
+                self.set_default_size(900, 650)
         else:
-            self.set_default_size(1100, 750)
+            self.set_default_size(900, 650)
 
         self.set_position(Gtk.WindowPosition.CENTER)
 
@@ -2576,3 +2727,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
