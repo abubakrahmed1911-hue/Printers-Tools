@@ -14,7 +14,7 @@
     },
     {
       "path": "public.pem",
-      "sha256": "75c17a1f7d31ae45852f90b1895b2a373cb2226e0bb2e78cddcfe2e9de909920"
+      "sha256": "038797f171f70658b49074f9f10e1f81d6166e598b5725d2bcceaa7d940f2084"
     },
     {
       "path": ".gitignore",
@@ -25,6 +25,6 @@
       "sha256": "0daa3a12f49237ecc41d493e8027f55a6283820a4fc9f14e988663205d1be1e1"
     }
   ],
-  "signature": "qUUr1bGZPNfMl+n49RVLAdDXY6imaviFgHXUDjFirmH9XRBtQnKWaMYhwsiUFecFR7yednBHysznFd3kGDiXBA==",
-  "public_key": "zxTR7vN7LGtHexrB7p2ldzSUCRvc25AOesbsRj6wY+8="
+  "signature": "obZEKq1MfZ1oh4/cIN8gHm2oPaIj3sH19OVXGmr/IwutOka659anI+hyh8xZYkg7mRVvV+MuwKXd879zkXf7AA==",
+  "public_key": "bBtrjHKyIelY2EBlxcdEfskgEXeXyxHVxUoz/WyIR5U="
 }
