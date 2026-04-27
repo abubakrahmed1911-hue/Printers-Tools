@@ -148,7 +148,7 @@ cat > "$SERVICE_TMP" << 'SERVICE_EOF'
 [Unit]
 Description=IT Aman Printer Daemon
 After=network.target cups.service
-Requires=cups.service
+Wants=cups.service
 
 [Service]
 Type=forking
