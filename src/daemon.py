@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-IT Aman Printer Daemon v3.20
+IT Aman Printer Daemon v3.21
 =============================
 A Unix socket daemon for managing CUPS printers on Linux.
 Runs as root, listens on /run/it-aman/it-aman.sock, and processes
