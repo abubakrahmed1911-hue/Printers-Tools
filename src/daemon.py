@@ -461,7 +461,7 @@ def tcp_check(ip: str, port: int, timeout: float = SCAN_TIMEOUT_SEC) -> bool:
         return False
 
 
-def scan_subnet_tcp(subnet: str) -> list[dict]:
+def scan_subnet_tcp(subnet: str):
     """
     Scan an entire /24 subnet for SCAN_PORTS using a thread pool.
     Returns list of dicts: {ip, port, open}.
@@ -620,7 +620,7 @@ def cups_stop() -> bool:
     return False
 
 
-def get_cups_backends() -> list[str]:
+def get_cups_backends():
     """Return list of URIs from lpinfo -v (existing CUPS backends)."""
     rc, out, _ = run_cmd(["lpinfo", "-v"])
     if rc != 0 or not out:
@@ -628,7 +628,7 @@ def get_cups_backends() -> list[str]:
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-def get_cups_ppd_drivers() -> list[dict]:
+def get_cups_ppd_drivers():
     """Return list of available PPD drivers from lpinfo -m."""
     rc, out, _ = run_cmd(["lpinfo", "-m"], timeout=15)
     if rc != 0 or not out:
@@ -678,7 +678,7 @@ def is_printer_exists(name: str) -> bool:
     return rc == 0
 
 
-def get_usb_uris() -> list[str]:
+def get_usb_uris():
     """Return list of USB printer URIs from lpinfo -v."""
     backends = get_cups_backends()
     return [b.split(":", 1)[1].strip() for b in backends if b.startswith("usb://")]
