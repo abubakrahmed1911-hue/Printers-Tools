@@ -50,7 +50,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "3.21"
+VERSION = "3.23"
 
 # Paths
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
@@ -2539,6 +2539,33 @@ def handle_update_all(params: dict) -> dict:
 
     if not files_list:
         return {"status": "error", "message": "Update manifest has no files to update"}
+
+    # Cross-check: verify the manifest's public_key matches the local public.pem
+    # This prevents an attacker from substituting the manifest with their own keypair.
+    try:
+        local_pem_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "public.pem"
+        )
+        if os.path.isfile(local_pem_path):
+            with open(local_pem_path, "r") as fh:
+                pem_content = fh.read().strip()
+            # Extract the base64 key from PEM
+            import base64 as _b64
+            pem_lines = [l for l in pem_content.splitlines() if not l.startswith("-----")]
+            local_key_b64 = "".join(pem_lines)
+            if local_key_b64 != public_key_b64:
+                log.error(
+                    "SECURITY: Manifest public_key (%s...) does NOT match local public.pem (%s...)! "
+                    "Possible tampering. Update rejected.",
+                    public_key_b64[:20], local_key_b64[:20],
+                )
+                return {"status": "error", "message": "Update manifest public key does not match trusted local key -- update rejected for security"}
+            report["actions"].append("Public key cross-check passed")
+        else:
+            log.warning("No local public.pem found — skipping key cross-check (less secure)")
+    except Exception as exc:
+        log.warning("Public key cross-check failed (non-fatal): %s", exc)
 
     try:
         sig_valid = _verify_ed25519_signature(

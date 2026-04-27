@@ -1,0 +1,23 @@
+# Prevent git from converting line endings in binary files
+# This is CRITICAL: without this, git may corrupt ELF binaries and PPD files
+# when pushing from Windows (MINGW), causing the 14-byte download issue.
+
+# CUPS filter binaries — must NEVER have line-ending conversion
+drivers/rastertoprinter binary
+drivers/rastertoprintercm binary
+drivers/rastertoprinterlm binary
+
+# PPD files — these are text-like but must preserve exact formatting
+drivers/*.ppd -diff -text
+
+# Python source files — normalize to LF (matches generate_manifest.py CRLF→LF)
+*.py text eol=lf
+
+# Shell scripts — must be LF for Linux
+*.sh text eol=lf
+
+# JSON files — text, normalize to LF
+*.json text eol=lf
+
+# PEM key files — text
+*.pem text eol=lf

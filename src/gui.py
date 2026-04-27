@@ -34,7 +34,7 @@ import re
 
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
 CONFIG_PATH = "/etc/it-aman/config.json"
-APP_VERSION = "3.16"
+APP_VERSION = "3.23"
 APP_NAME = "IT Aman - Printer Support Tool"
 DEVELOPER = "Developed by: IT Helpdesk Operation"
 
@@ -2384,7 +2384,7 @@ class UpdateDialog:
         title.set_halign(Gtk.Align.CENTER)
         content.pack_start(title, False, False, 0)
 
-        cur = Gtk.Label(t("update_current", lang).format(APP_VERSION))
+        cur = Gtk.Label(t("update_current", lang).format(self.app._local_version))
         cur.set_halign(Gtk.Align.CENTER)
         content.pack_start(cur, False, False, 0)
 
@@ -2474,6 +2474,8 @@ class ITAmanApp(Gtk.Window):
         self._update_banner = None
         self._update_available_version = None
         self._update_dismissed_version = None  # track dismissed updates so we don't re-show
+        self._update_check_done = False  # track if initial update check was done
+        self._local_version = APP_VERSION  # will be updated from daemon
 
         # Background update check: first after 5s, then every 300s (5 min)
         # Don't check too frequently to avoid performance issues
@@ -2627,6 +2629,12 @@ class ITAmanApp(Gtk.Window):
         screen = MainMenuScreen(self)
         self.set_screen(screen, t("main_title", self.lang), f"v{APP_VERSION}",
                          show_back=False)
+        # ── CRITICAL: Check for updates IMMEDIATELY after showing main menu ──
+        # This is the first thing the user sees after selecting language.
+        # If an update is available, show a modal dialog right away.
+        if not self._update_check_done:
+            self._update_check_done = True
+            GLib.timeout_add_seconds(1, self._startup_update_check)
 
     def show_paper_jam(self):
         screen = PaperJamScreen(self)
@@ -2665,6 +2673,21 @@ class ITAmanApp(Gtk.Window):
 
     # ── update check ──
 
+    def _startup_update_check(self):
+        """Check for updates IMMEDIATELY after first showing main menu.
+        If an update is available, show a modal dialog (not just a banner).
+        This ensures users who are not technical see the update prompt right away.
+        """
+        def on_startup_check(result):
+            if result.get("status") == "ok" and result.get("update_available", False):
+                new_ver = result.get("version", "")
+                if new_ver and new_ver != self._update_dismissed_version:
+                    # Show a modal dialog immediately — hard to miss
+                    self._update_available_version = new_ver
+                    UpdateDialog(self, new_ver)
+        self.daemon.send_threaded({"action": "check_update"}, on_startup_check, timeout=15)
+        return False  # Don't repeat
+
     def _periodic_update_check(self):
         """Check for updates every 5 minutes. Show banner if update found."""
         self.daemon.send_threaded({"action": "check_update"}, self._on_update_check_result, timeout=15)
@@ -2676,6 +2699,8 @@ class ITAmanApp(Gtk.Window):
         if result.get("status") == "ok":
             update_available = result.get("update_available", False)
             latest = result.get("version", APP_VERSION)
+            local = result.get("local_version", APP_VERSION)
+            self._local_version = local  # always update from daemon
             # FIX: Use the daemon's proper version comparison instead of string !=
             if update_available and latest != self._update_dismissed_version:
                 self._show_update_banner(latest)
@@ -2705,7 +2730,7 @@ class ITAmanApp(Gtk.Window):
         icon = Gtk.Image.new_from_icon_name("software-update-available", Gtk.IconSize.MENU)
         banner.pack_start(icon, False, False, 0)
 
-        msg = t("update_available", lang) + f"  ({APP_VERSION} → {new_version})"
+        msg = t("update_available", lang) + f"  ({self._local_version} → {new_version})"
         msg_lbl = Gtk.Label(label=msg)
         msg_lbl.set_halign(Gtk.Align.START)
         banner.pack_start(msg_lbl, True, True, 0)

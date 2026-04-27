@@ -36,6 +36,7 @@ UPDATE_FILES = [
     "version.json",
     "public.pem",
     ".gitignore",
+    ".gitattributes",
 ]
 
 # ── Key paths ──
@@ -177,10 +178,34 @@ def generate_manifest():
     with open(manifest_path, "w") as fh:
         json.dump(manifest, fh, indent=2)
 
+    # ── CRITICAL: Sync public.pem in repo with the key used for signing ──
+    # This ensures public.pem ALWAYS matches the public_key in the manifest.
+    # Without this, the daemon would reject updates because the keys don't match.
+    repo_pem = REPO_ROOT / "public.pem"
+    pem_content = (
+        "-----BEGIN PUBLIC KEY-----\n"
+        + public_key_b64
+        + "\n-----END PUBLIC KEY-----\n"
+    )
+    # Check if public.pem needs updating
+    needs_update = True
+    if repo_pem.exists():
+        with open(repo_pem, "r") as fh:
+            existing = fh.read().strip()
+        if existing == pem_content.strip():
+            needs_update = False
+    if needs_update:
+        with open(repo_pem, "w") as fh:
+            fh.write(pem_content)
+        print(f"  ✅ Synced public.pem with manifest public key")
+    else:
+        print(f"  ✓ public.pem already matches manifest public key")
+
     print()
     print(f"✅ Manifest written to {manifest_path}")
     print(f"   Files: {len(files_list)}")
     print(f"   Signature: {signature_b64[:24]}...")
+    print(f"   Public key: {public_key_b64[:24]}...")
     print()
     print("Next steps:")
     print("  1. git add -A")
