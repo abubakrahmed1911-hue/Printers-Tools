@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
-# IT Aman Printer Tool v3.19 — Installation Script
+# IT Aman Printer Tool v3.20 — Installation Script
 # ═══════════════════════════════════════════════════════════
 
 set -e
@@ -18,7 +18,7 @@ POLICY_FILE="/usr/share/polkit-1/actions/com.it-aman.gui.policy"
 SUDOERS_FILE="/etc/sudoers.d/it-aman-gui"
 
 echo "========================================"
-echo " IT Aman Printer Tool v3.19 Installer"
+echo " IT Aman Printer Tool v3.20 Installer"
 echo "========================================"
 echo ""
 
@@ -220,7 +220,7 @@ sleep 2
 if systemctl is-active --quiet it-aman.service; then
     echo ""
     echo "╔══════════════════════════════════════════════════╗"
-    echo "║  IT Aman Printer Tool v3.19 installed!          ║"
+    echo "║  IT Aman Printer Tool v3.20 installed!          ║"
     echo "╠══════════════════════════════════════════════════╣"
     echo "║  Daemon: ACTIVE (running in background)         ║"
     echo "║  Socket: $SOCKET_DIR/it-aman.sock"

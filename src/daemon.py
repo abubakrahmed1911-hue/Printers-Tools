@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-IT Aman Printer Daemon v3.19
+IT Aman Printer Daemon v3.20
 =============================
 A Unix socket daemon for managing CUPS printers on Linux.
 Runs as root, listens on /run/it-aman/it-aman.sock, and processes
 JSON commands from the GTK3 GUI client.
 Developed by IT Helpdesk Operation.
 
-Key changes from v3.18:
-  - CRITICAL FIX: Auto-update restart now uses 'systemctl restart'
-    instead of os.execv() — the old method broke with systemd
-    Type=forking because the new process would double-fork again,
-    losing the PID systemd tracks, causing the service to appear dead
-  - SIMPLIFIED: Removed Ed25519/manifest path from auto-update —
-    it was unreliable (PyNaCl rarely installed) and added complexity
-    for no real benefit over HTTPS direct download
-  - VERSION bumped to 3.19
+Key changes from v3.19:
+  - RESTORED: Ed25519 manifest signature verification for auto-update
+    (was wrongly removed in v3.19 - direct HTTPS without verification
+    is a security risk, allowing potential code injection)
+  - Auto-update now goes through handle_update_all() with FULL security:
+    Ed25519 signature -> SHA256 per-file -> chattr -i unlock -> replace
+  - Restart still uses systemctl (the v3.19 fix that was correct)
+  - VERSION bumped to 3.20
 
 Architecture:
   - Unix socket at /run/it-aman/it-aman.sock
@@ -51,7 +50,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "3.19"
+VERSION = "3.20"
 
 # Paths
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
@@ -3132,92 +3131,17 @@ AUTO_UPDATE_FILES = [
 
 def _auto_install_simple(remote_version: str) -> dict:
     """
-    Direct HTTPS download auto-install from GitHub.
-    No Ed25519/manifest needed — HTTPS provides integrity.
-    Downloads each file, replaces, then restarts via systemctl.
+    Auto-update entry point called by the background auto-update loop.
+    Delegates to handle_update_all() which provides full security:
+      - Ed25519 signature verification of the manifest
+      - SHA256 verification of each downloaded file
+      - chattr -i unlocking before file replacement
+      - systemctl restart after successful update
 
-    This is the ONLY auto-update path. Simple and reliable.
+    This ensures auto-updates are SECURE (verified) and RELIABLE (proper restart).
     """
-    report = {"status": "ok", "actions": []}
-    install_dir = os.path.dirname(os.path.abspath(__file__))
-    base_dir = os.path.dirname(install_dir)  # /opt/it-aman
-    backup_dir = base_dir + ".backup"
-
-    log.info("Auto-update: downloading v%s from GitHub (direct HTTPS)", remote_version)
-
-    # CRITICAL: Unlock all files before backup/replace (chattr +i blocks even root)
-    log.info("Unlocking files (chattr -i) before update...")
-    for rel_path in AUTO_UPDATE_FILES:
-        dest_path = os.path.join(base_dir, rel_path)
-        _chattr_unlock(dest_path)
-    # Also unlock the backup dir if it exists from a previous attempt
-    if os.path.exists(backup_dir):
-        run_cmd(["chattr", "-R", "-i", backup_dir], timeout=10)
-
-    # Create backup
-    try:
-        if os.path.exists(backup_dir):
-            shutil.rmtree(backup_dir)
-        shutil.copytree(base_dir, backup_dir)
-        report["actions"].append(f"Backed up current files to {backup_dir}")
-    except Exception as exc:
-        log.warning("Failed to create backup: %s", exc)
-
-    # Download each file
-    updated_files = []
-    for rel_path in AUTO_UPDATE_FILES:
-        download_url = f"{RAW_BASE}/{rel_path}"
-        dest_path = os.path.join(base_dir, rel_path)
-        tmp_dest = dest_path + ".new"
-
-        log.info("Auto-update downloading: %s", rel_path)
-        if not download_file(download_url, tmp_dest, rel_path):
-            report["actions"].append(f"Failed to download {rel_path}")
-            continue
-
-        # Verify the file is not empty and looks like valid code
-        try:
-            if os.path.getsize(tmp_dest) < 100:
-                log.warning("Downloaded file too small: %s", rel_path)
-                os.remove(tmp_dest)
-                continue
-        except Exception:
-            continue
-
-        # Replace the file — unlock immutable flag first
-        try:
-            _chattr_unlock(dest_path)
-            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-            os.replace(tmp_dest, dest_path)
-            updated_files.append(rel_path)
-            report["actions"].append(f"Updated: {rel_path}")
-        except Exception as exc:
-            log.error("Failed to replace %s: %s", rel_path, exc)
-            if os.path.isfile(tmp_dest):
-                os.remove(tmp_dest)
-
-    if not updated_files:
-        # Restore backup
-        try:
-            if os.path.exists(backup_dir):
-                shutil.rmtree(base_dir)
-                shutil.copytree(backup_dir, base_dir)
-        except Exception:
-            pass
-        return {"status": "error", "message": "No files were successfully updated", "actions": report["actions"]}
-
-    # Update config with new version
-    cfg = load_config()
-    cfg["version"] = remote_version
-    save_config(cfg)
-
-    report["actions"].append(f"Updated {len(updated_files)} file(s)")
-    report["new_version"] = remote_version
-    report["actions"].append("Daemon will restart to apply updates")
-
-    # Schedule restart via systemctl (the CORRECT way for systemd services)
-    _schedule_daemon_restart()
-    return report
+    log.info("Auto-update: v%s -> v%s (via handle_update_all with manifest verification)", VERSION, remote_version)
+    return handle_update_all({})
 
 
 def _auto_update_loop():
