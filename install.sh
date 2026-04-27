@@ -33,7 +33,8 @@ echo "[1/10] Installing dependencies..."
 apt-get update -qq
 apt-get install -y -qq python3 python3-gi python3-gi-cairo gir1.2-gtk-3.0 \
     cups cups-bsd avahi-daemon avahi-utils \
-    curl wget policykit-1 2>/dev/null || true
+    curl wget policykit-1 python3-pip 2>/dev/null || true
+pip3 install -q pynacl 2>/dev/null || pip install -q pynacl 2>/dev/null || true
 
 # ── 2. Stop old service if running ──
 echo "[2/10] Stopping old service (if any)..."

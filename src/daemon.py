@@ -410,7 +410,7 @@ def download_file(url: str, dest: str, desc: str = "file") -> bool:
         return False
 
 
-def download_text(url: str, timeout: int = 30) -> str | None:
+def download_text(url: str, timeout: int = 30):
     """Download a small text file and return its content, or None on error."""
     try:
         req = urllib.request.Request(url, headers={
@@ -423,7 +423,7 @@ def download_text(url: str, timeout: int = 30) -> str | None:
         return None
 
 
-def get_local_subnet() -> str | None:
+def get_local_subnet():
     """
     Determine the local /24 subnet for scanning.
     Returns something like '192.168.1' or None.
@@ -491,7 +491,7 @@ def scan_subnet_tcp(subnet: str) -> list[dict]:
 # HTTP model probe (used by network_scan)
 # ---------------------------------------------------------------------------
 
-def _http_probe_single_url(url: str, timeout: float) -> str | None:
+def _http_probe_single_url(url: str, timeout: float):
     """
     Probe a single URL for printer model info.
     Returns model string or None. Uses short timeout for speed.
@@ -523,7 +523,7 @@ def _http_probe_single_url(url: str, timeout: float) -> str | None:
     return None
 
 
-def http_probe_model(ip: str) -> str | None:
+def http_probe_model(ip: str):
     """
     Try to determine the printer model via HTTP/IPP queries.
     Uses CONCURRENT probes with SHORT timeout (2s) and EARLY TERMINATION
@@ -647,7 +647,7 @@ def get_cups_ppd_drivers() -> list[dict]:
     return drivers
 
 
-def find_ppd_for_model(model: str) -> str | None:
+def find_ppd_for_model(model: str):
     """
     Search lpinfo -m output for a PPD matching the given model name.
     Returns the PPD name (e.g. 'manufacturer-PPDs/Kyocera/...') or None.
@@ -684,7 +684,7 @@ def get_usb_uris() -> list[str]:
     return [b.split(":", 1)[1].strip() for b in backends if b.startswith("usb://")]
 
 
-def _get_printer_device_uri(name: str) -> str | None:
+def _get_printer_device_uri(name: str):
     """Get the device URI for a given printer name via lpstat -v."""
     rc, out, _ = run_cmd(["lpstat", "-v", name])
     if rc == 0 and out:
@@ -709,7 +709,7 @@ def _get_printer_job_count(name: str) -> int:
     return count
 
 
-def _get_default_printer() -> str | None:
+def _get_default_printer():
     """Get the default printer name via lpstat -d."""
     rc, out, _ = run_cmd(["lpstat", "-d"])
     if rc == 0 and out:
@@ -794,7 +794,7 @@ def value_size_thermal_pick(printer_name: str) -> str:
     return "media=80mm"
 
 
-def resolve_thermal_size_from_tokens(text: str) -> str | None:
+def resolve_thermal_size_from_tokens(text: str):
     """
     Scan text (lpoptions output, PPD info, etc.) for thermal paper size clues.
     Looks for known thermal width markers: 58mm, 80mm, 76mm, etc.
@@ -814,7 +814,7 @@ def resolve_thermal_size_from_tokens(text: str) -> str | None:
     return None
 
 
-def resolve_forced_custom_size_from_tokens(text: str) -> str | None:
+def resolve_forced_custom_size_from_tokens(text: str):
     """
     Examine device URI or model name for forced size hints.
     XP-80 => 80mm, XP-58 => 58mm, etc.
@@ -3112,7 +3112,7 @@ def process_command(data: dict) -> dict:
 # Unix socket server
 # ---------------------------------------------------------------------------
 
-def recv_message(conn: socket.socket) -> bytes | None:
+def recv_message(conn: socket.socket):
     """
     Receive a newline-delimited JSON message from the socket.
     Protocol: read until newline (\n), then return the payload without it.
