@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
-# IT Aman Printer Tool v3.17 — Installation Script
+# IT Aman Printer Tool v3.18 — Installation Script
 # ═══════════════════════════════════════════════════════════
 
 set -e
@@ -18,7 +18,7 @@ POLICY_FILE="/usr/share/polkit-1/actions/com.it-aman.gui.policy"
 SUDOERS_FILE="/etc/sudoers.d/it-aman-gui"
 
 echo "========================================"
-echo " IT Aman Printer Tool v3.17 Installer"
+echo " IT Aman Printer Tool v3.18 Installer"
 echo "========================================"
 echo ""
 
@@ -214,31 +214,13 @@ systemctl daemon-reload
 systemctl enable it-aman.service
 systemctl restart it-aman.service
 
-# ── 11. Protect files with chattr +i (auto-update will unlock before updating) ──
-echo "[post-install] Protecting files with chattr +i..."
-# Lock main program files to prevent accidental modification
-# The daemon auto-updater will run 'chattr -i' before replacing files,
-# then re-apply 'chattr +i' after a successful update.
-for f in "$INSTALL_DIR/src/daemon.py" "$INSTALL_DIR/src/gui.py" "$INSTALL_DIR/version.json" "$INSTALL_DIR/public.pem"; do
-    if [ -f "$f" ]; then
-        chattr +i "$f" 2>/dev/null || true
-    fi
-done
-# Lock CUPS driver files too
-for f in /usr/lib/cups/filter/rastertoprinter /usr/lib/cups/filter/rastertoprintercm /usr/lib/cups/filter/rastertoprinterlm /usr/share/cups/model/80mmSeries.ppd; do
-    if [ -f "$f" ]; then
-        chattr +i "$f" 2>/dev/null || true
-    fi
-done
-echo "  ✓ Files protected (chattr +i)"
-
 # ── Verify ──
 sleep 2
 
 if systemctl is-active --quiet it-aman.service; then
     echo ""
     echo "╔══════════════════════════════════════════════════╗"
-    echo "║  IT Aman Printer Tool v3.17 installed!          ║"
+    echo "║  IT Aman Printer Tool v3.18 installed!          ║"
     echo "╠══════════════════════════════════════════════════╣"
     echo "║  Daemon: ACTIVE (running in background)         ║"
     echo "║  Socket: $SOCKET_DIR/it-aman.sock"

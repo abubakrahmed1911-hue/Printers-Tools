@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 """
-IT Aman Printer Daemon v3.17
+IT Aman Printer Daemon v3.18
 =============================
 A Unix socket daemon for managing CUPS printers on Linux.
 Runs as root, listens on /run/it-aman/it-aman.sock, and processes
 JSON commands from the GTK3 GUI client.
 Developed by IT Helpdesk Operation.
 
-Key changes from v3.16:
-  - CRITICAL FIX: Auto-update now handles chattr +i (immutable) files
-    by running chattr -i before replacing and chattr +i after
-  - CRITICAL FIX: install.sh now unlocks immutable files before install
-    and re-applies chattr +i protection after successful install
-  - FIX: Thermal driver install (_install_local_drivers) now unlocks
-    CUPS filter/model files before overwriting them
-  - VERSION bumped to 3.17
+Key changes from v3.17:
+  - REMOVED: chattr +i (file locking) — employees delete files anyway,
+    and the immutable flag was blocking auto-updates. We now only
+    UNLOCK (chattr -i) to clear any stale immutable flags, never lock.
+  - VERSION bumped to 3.18
 
 Architecture:
   - Unix socket at /run/it-aman/it-aman.sock
@@ -50,7 +47,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "3.17"
+VERSION = "3.18"
 
 # Paths
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
@@ -312,21 +309,9 @@ def _chattr_unlock(path: str) -> bool:
     return True  # Don't block updates if chattr isn't available
 
 
-def _chattr_lock(path: str) -> bool:
-    """
-    Re-apply the immutable attribute (chattr +i) to protect a file from
-    accidental modification.  Called after a successful update.
-
-    Returns True on success.
-    """
-    if not os.path.isfile(path):
-        return False
-    rc, _, err = run_cmd(["chattr", "+i", path], timeout=5)
-    if rc == 0:
-        log.info("chattr +i re-applied on %s", path)
-        return True
-    log.debug("chattr +i on %s returned %d: %s", path, rc, err)
-    return False
+# NOTE: No _chattr_lock() — we do NOT re-apply chattr +i after updates.
+# chattr +i was causing problems: employees delete files anyway, and the
+# immutable flag breaks auto-updates. We only UNLOCK (chattr -i), never lock.
 
 
 # ---------------------------------------------------------------------------
@@ -1343,8 +1328,6 @@ def _install_local_drivers() -> list:
                 os.makedirs(CUPS_FILTER_DIR, exist_ok=True)
                 shutil.copy2(src_path, dst_path)
                 os.chmod(dst_path, 0o755)
-                # Re-lock for protection
-                _chattr_lock(dst_path)
                 actions.append(f"Installed filter: {dst_path}")
                 log.info("Installed thermal filter: %s -> %s", src_path, dst_path)
             except Exception as exc:
@@ -1383,8 +1366,6 @@ def _install_local_drivers() -> list:
                     actions.append("Patched PPD: FullCut -> PartialCut default")
             except Exception as exc:
                 log.debug("PPD patch failed (non-fatal): %s", exc)
-            finally:
-                _chattr_lock(ppd_dest)
         except Exception as exc:
             actions.append(f"Failed to install PPD: {exc}")
             log.error("Failed to install PPD: %s", exc)
@@ -2623,12 +2604,6 @@ def handle_update_all(params: dict) -> dict:
     cfg["version"] = remote_version
     save_config(cfg)
 
-    # Re-apply immutable protection on updated files
-    log.info("Re-locking updated files (chattr +i) for protection...")
-    for rel_path in updated_files:
-        dest_path = os.path.join(base_dir, rel_path)
-        _chattr_lock(dest_path)
-
     # --- Step 6: Restart daemon ---
     report["actions"].append(f"Updated {len(updated_files)} file(s)")
     report["actions"].append("Daemon will restart to apply updates")
@@ -3234,12 +3209,6 @@ def _auto_install_simple(remote_version: str) -> dict:
         except Exception:
             pass
         return {"status": "error", "message": "No files were successfully updated", "actions": report["actions"]}
-
-    # Re-apply immutable protection on updated files
-    log.info("Re-locking updated files (chattr +i) for protection...")
-    for rel_path in updated_files:
-        dest_path = os.path.join(base_dir, rel_path)
-        _chattr_lock(dest_path)
 
     # Update config with new version
     cfg = load_config()
