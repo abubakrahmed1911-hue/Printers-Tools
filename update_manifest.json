@@ -2,15 +2,15 @@
   "files": [
     {
       "path": "src/daemon.py",
-      "sha256": "447faa3b0e47c83b0831ce6c6bcd2ed4df149a997dc89275ed2fa996dc30b53e"
+      "sha256": "7b12087c3bf9cd88d09277bb67d015e4c108c240dee302b224c333704a849df6"
     },
     {
       "path": "src/gui.py",
-      "sha256": "d22dec46f1052bb5922451196fe8d86c09658c4a5486e1eeb93e257f1907cfe6"
+      "sha256": "6deaf95491734bb2ab85a55016f9077c2b07d0d20dec6bfefab5cb7e4f18ac74"
     },
     {
       "path": "version.json",
-      "sha256": "673904d6e4df76f92c19219dae8b066a6245c9fec193ace67018f03a4810421d"
+      "sha256": "1b285cf064d8f39eed49e0a112caaaa7e26c37a48e16946ea630cc9579ca76f6"
     },
     {
       "path": "public.pem",
@@ -21,6 +21,6 @@
       "sha256": "458ce643832e42c98c00d251f12eee048e6a58e057cc35ffa957b6c29a23f6dd"
     }
   ],
-  "signature": "uuLptpCMZLZ3BnxYLMMIifPwQo3OfxGFzP2z+fDYeb+nISa6WCmVMDz5brC4zwYA3W0dna2BvKtvHcjcsiv0DA==",
+  "signature": "5v9ktb6shTIWLPyZAt3qmemrj+1iGLLJQ4dRaigo+K1RR6JcqR3V6i9lcAQ7rPlBzl5uqsRueoxuhapRak4YAg==",
   "public_key": "bBtrjHKyIelY2EBlxcdEfskgEXeXyxHVxUoz/WyIR5U="
 }
