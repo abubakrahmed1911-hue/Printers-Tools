@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-IT Aman Printer Daemon v3.18
+IT Aman Printer Daemon v3.19
 =============================
 A Unix socket daemon for managing CUPS printers on Linux.
 Runs as root, listens on /run/it-aman/it-aman.sock, and processes
 JSON commands from the GTK3 GUI client.
 Developed by IT Helpdesk Operation.
 
-Key changes from v3.17:
-  - REMOVED: chattr +i (file locking) — employees delete files anyway,
-    and the immutable flag was blocking auto-updates. We now only
-    UNLOCK (chattr -i) to clear any stale immutable flags, never lock.
-  - VERSION bumped to 3.18
+Key changes from v3.18:
+  - CRITICAL FIX: Auto-update restart now uses 'systemctl restart'
+    instead of os.execv() — the old method broke with systemd
+    Type=forking because the new process would double-fork again,
+    losing the PID systemd tracks, causing the service to appear dead
+  - SIMPLIFIED: Removed Ed25519/manifest path from auto-update —
+    it was unreliable (PyNaCl rarely installed) and added complexity
+    for no real benefit over HTTPS direct download
+  - VERSION bumped to 3.19
 
 Architecture:
   - Unix socket at /run/it-aman/it-aman.sock
@@ -47,7 +51,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "3.18"
+VERSION = "3.19"
 
 # Paths
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
@@ -287,6 +291,33 @@ def run_cmd(cmd: list, timeout: int = 30, check: bool = False) -> tuple:
 def run_shell(script: str, timeout: int = 60) -> tuple:
     """Run a shell command string and return (returncode, stdout, stderr)."""
     return run_cmd(["bash", "-c", script], timeout=timeout)
+
+
+def _schedule_daemon_restart():
+    """
+    Schedule a proper daemon restart using systemctl.
+    This is the CORRECT way to restart a systemd-managed daemon:
+      - os.execv() was broken with Type=forking services because the
+        new process would double-fork again, losing the PID that systemd
+        tracks, causing it to think the service died.
+      - systemctl restart handles PID tracking, socket cleanup, etc.
+    """
+    def _do_restart():
+        time.sleep(2)
+        log.info("Restarting daemon via systemctl restart it-aman.service...")
+        try:
+            subprocess.Popen(
+                ["systemctl", "restart", "it-aman.service"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            log.error("systemctl restart failed: %s — falling back to os.execv", exc)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        # Exit current process; systemd will start a fresh one
+        os._exit(0)
+
+    threading.Thread(target=_do_restart, daemon=True).start()
 
 
 def _chattr_unlock(path: str) -> bool:
@@ -2610,12 +2641,7 @@ def handle_update_all(params: dict) -> dict:
     report["new_version"] = remote_version
 
     # Schedule restart in a separate thread so we can send the response first
-    def _restart_daemon():
-        time.sleep(2)
-        log.info("Restarting daemon after update...")
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-
-    threading.Thread(target=_restart_daemon, daemon=True).start()
+    _schedule_daemon_restart()
 
     return report
 
@@ -3106,48 +3132,18 @@ AUTO_UPDATE_FILES = [
 
 def _auto_install_simple(remote_version: str) -> dict:
     """
-    Simplified auto-install that downloads files directly from GitHub
-    over HTTPS without requiring Ed25519 manifest signature.
-    This is used by the background auto-updater for seamless updates.
+    Direct HTTPS download auto-install from GitHub.
+    No Ed25519/manifest needed — HTTPS provides integrity.
+    Downloads each file, replaces, then restarts via systemctl.
 
-    Security: Downloads are over HTTPS (TLS) which provides integrity
-    and authenticity. SHA256 verification is done against the downloaded
-    manifest if available, otherwise files are downloaded directly.
-
-    Steps:
-      1. Try manifest-based update with Ed25519 (if signature valid)
-      2. Fall back to direct download of each file over HTTPS
-      3. Replace files and restart daemon
+    This is the ONLY auto-update path. Simple and reliable.
     """
     report = {"status": "ok", "actions": []}
     install_dir = os.path.dirname(os.path.abspath(__file__))
     base_dir = os.path.dirname(install_dir)  # /opt/it-aman
     backup_dir = base_dir + ".backup"
 
-    # --- Try manifest-based update first (with Ed25519) ---
-    try:
-        manifest_url = f"{RAW_BASE}/update_manifest.json"
-        manifest_text = download_text(manifest_url, timeout=15)
-        if manifest_text:
-            manifest = json.loads(manifest_text)
-            sig_b64 = manifest.get("signature", "")
-            pub_b64 = manifest.get("public_key", "")
-            files_list = manifest.get("files", [])
-            if sig_b64 and pub_b64 and files_list:
-                try:
-                    sig_valid = _verify_ed25519_signature(pub_b64, sig_b64, files_list)
-                    if sig_valid:
-                        log.info("Manifest signature valid -- using signed update")
-                        report["actions"].append("Ed25519 signature verified")
-                        # Use the manifest-based update
-                        return handle_update_all({})
-                except Exception:
-                    log.debug("Ed25519 verification failed, falling back to direct download")
-    except Exception as exc:
-        log.debug("Manifest fetch failed, using direct download: %s", exc)
-
-    # --- Fall back: Direct HTTPS download ---
-    log.info("Using direct HTTPS download for auto-update %s -> %s", VERSION, remote_version)
+    log.info("Auto-update: downloading v%s from GitHub (direct HTTPS)", remote_version)
 
     # CRITICAL: Unlock all files before backup/replace (chattr +i blocks even root)
     log.info("Unlocking files (chattr -i) before update...")
@@ -3219,14 +3215,8 @@ def _auto_install_simple(remote_version: str) -> dict:
     report["new_version"] = remote_version
     report["actions"].append("Daemon will restart to apply updates")
 
-    # Schedule restart
-    def _restart_daemon():
-        time.sleep(2)
-        log.info("Restarting daemon after auto-update...")
-        # Unlock self before restart so the new version can be updated in the future
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-
-    threading.Thread(target=_restart_daemon, daemon=True).start()
+    # Schedule restart via systemctl (the CORRECT way for systemd services)
+    _schedule_daemon_restart()
     return report
 
 
