@@ -49,14 +49,21 @@ REPO_ROOT = Path(__file__).parent.resolve()
 
 
 def sha256_file(path: str) -> str:
-    """Compute SHA-256 hex digest of a file."""
+    """Compute SHA-256 hex digest of a file.
+    
+    IMPORTANT: Normalizes CRLF to LF before hashing.
+    This script runs on Windows (CRLF) but the Linux devices download
+    files from GitHub with LF line endings. Without normalization,
+    the SHA256 in the manifest would NEVER match what the device computes,
+    causing every update to be rejected (SHA256 mismatch).
+    """
     h = hashlib.sha256()
     with open(path, "rb") as fh:
-        while True:
-            chunk = fh.read(65536)
-            if not chunk:
-                break
-            h.update(chunk)
+        data = fh.read()
+    # Normalize: CRLF (Windows) → LF (Unix)
+    # This matches what GitHub serves via raw.githubusercontent.com
+    data = data.replace(b"\r\n", b"\n")
+    h.update(data)
     return h.hexdigest()
 
 

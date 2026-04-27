@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
-# IT Aman Printer Tool v3.20 — Installation Script
+# IT Aman Printer Tool v3.21 — Installation Script
 # ═══════════════════════════════════════════════════════════
 
 set -e
@@ -18,7 +18,7 @@ POLICY_FILE="/usr/share/polkit-1/actions/com.it-aman.gui.policy"
 SUDOERS_FILE="/etc/sudoers.d/it-aman-gui"
 
 echo "========================================"
-echo " IT Aman Printer Tool v3.20 Installer"
+echo " IT Aman Printer Tool v3.21 Installer"
 echo "========================================"
 echo ""
 
@@ -56,6 +56,12 @@ fi
 for f in /usr/lib/cups/filter/rastertoprinter /usr/lib/cups/filter/rastertoprintercm /usr/lib/cups/filter/rastertoprinterlm /usr/share/cups/model/80mmSeries.ppd; do
     chattr -i "$f" 2>/dev/null || true
 done
+# Unlock systemd service file — CRITICAL for install.sh to be able to write it!
+chattr -i "$SERVICE_FILE" 2>/dev/null || true
+# Unlock polkit and sudoers files too
+chattr -i "$POLICY_FILE" 2>/dev/null || true
+chattr -i "$SUDOERS_FILE" 2>/dev/null || true
+chattr -i "$DESKTOP_FILE" 2>/dev/null || true
 echo "  ✓ Immutable flags cleared"
 
 # ── 3. Download files from GitHub ──
@@ -220,7 +226,7 @@ sleep 2
 if systemctl is-active --quiet it-aman.service; then
     echo ""
     echo "╔══════════════════════════════════════════════════╗"
-    echo "║  IT Aman Printer Tool v3.20 installed!          ║"
+    echo "║  IT Aman Printer Tool v3.21 installed!          ║"
     echo "╠══════════════════════════════════════════════════╣"
     echo "║  Daemon: ACTIVE (running in background)         ║"
     echo "║  Socket: $SOCKET_DIR/it-aman.sock"

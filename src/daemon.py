@@ -50,7 +50,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "3.20"
+VERSION = "3.21"
 
 # Paths
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
@@ -2675,14 +2675,20 @@ def _compare_versions(v1: str, v2: str) -> int:
 
 
 def _sha256_file(path: str) -> str:
-    """Compute SHA-256 hex digest of a file."""
+    """Compute SHA-256 hex digest of a file.
+    
+    Normalizes CRLF to LF before hashing to match what generate_manifest.py
+    produces on Windows. This ensures SHA256 verification works regardless
+    of whether the file was downloaded from GitHub (LF) or came from a
+    Windows-created manifest (where CRLF→LF normalization was applied).
+    """
     h = hashlib.sha256()
     with open(path, "rb") as fh:
-        while True:
-            chunk = fh.read(65536)
-            if not chunk:
-                break
-            h.update(chunk)
+        data = fh.read()
+    # Normalize: CRLF (Windows) → LF (Unix)
+    # This matches the normalization in generate_manifest.py
+    data = data.replace(b"\r\n", b"\n")
+    h.update(data)
     return h.hexdigest()
 
 
