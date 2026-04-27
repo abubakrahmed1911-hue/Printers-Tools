@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
-# IT Aman Printer Tool v3.16 — Installation Script
+# IT Aman Printer Tool v3.17 — Installation Script
 # ═══════════════════════════════════════════════════════════
 
 set -e
@@ -18,7 +18,7 @@ POLICY_FILE="/usr/share/polkit-1/actions/com.it-aman.gui.policy"
 SUDOERS_FILE="/etc/sudoers.d/it-aman-gui"
 
 echo "========================================"
-echo " IT Aman Printer Tool v3.16 Installer"
+echo " IT Aman Printer Tool v3.17 Installer"
 echo "========================================"
 echo ""
 
@@ -39,6 +39,24 @@ apt-get install -y -qq python3 python3-gi python3-gi-cairo gir1.2-gtk-3.0 \
 echo "[2/10] Stopping old service (if any)..."
 systemctl stop it-aman.service 2>/dev/null || true
 systemctl disable it-aman.service 2>/dev/null || true
+
+# ── 2b. Unlock immutable files (chattr +i blocks updates!) ──
+echo "  Unlocking immutable files (chattr -i)..."
+# Remove immutable flag from ALL files in the install dir
+# This is CRITICAL: if someone ran 'chattr +i' on daemon.py, gui.py, etc.,
+# even root cannot overwrite them — which breaks auto-updates.
+if [ -d "$INSTALL_DIR" ]; then
+    chattr -R -i "$INSTALL_DIR" 2>/dev/null || true
+fi
+# Also unlock backup dir if it exists
+if [ -d "${INSTALL_DIR}.backup" ]; then
+    chattr -R -i "${INSTALL_DIR}.backup" 2>/dev/null || true
+fi
+# Unlock CUPS driver files that may have been protected
+for f in /usr/lib/cups/filter/rastertoprinter /usr/lib/cups/filter/rastertoprintercm /usr/lib/cups/filter/rastertoprinterlm /usr/share/cups/model/80mmSeries.ppd; do
+    chattr -i "$f" 2>/dev/null || true
+done
+echo "  ✓ Immutable flags cleared"
 
 # ── 3. Download files from GitHub ──
 echo "[3/10] Downloading IT Aman files..."
@@ -196,13 +214,31 @@ systemctl daemon-reload
 systemctl enable it-aman.service
 systemctl restart it-aman.service
 
+# ── 11. Protect files with chattr +i (auto-update will unlock before updating) ──
+echo "[post-install] Protecting files with chattr +i..."
+# Lock main program files to prevent accidental modification
+# The daemon auto-updater will run 'chattr -i' before replacing files,
+# then re-apply 'chattr +i' after a successful update.
+for f in "$INSTALL_DIR/src/daemon.py" "$INSTALL_DIR/src/gui.py" "$INSTALL_DIR/version.json" "$INSTALL_DIR/public.pem"; do
+    if [ -f "$f" ]; then
+        chattr +i "$f" 2>/dev/null || true
+    fi
+done
+# Lock CUPS driver files too
+for f in /usr/lib/cups/filter/rastertoprinter /usr/lib/cups/filter/rastertoprintercm /usr/lib/cups/filter/rastertoprinterlm /usr/share/cups/model/80mmSeries.ppd; do
+    if [ -f "$f" ]; then
+        chattr +i "$f" 2>/dev/null || true
+    fi
+done
+echo "  ✓ Files protected (chattr +i)"
+
 # ── Verify ──
 sleep 2
 
 if systemctl is-active --quiet it-aman.service; then
     echo ""
     echo "╔══════════════════════════════════════════════════╗"
-    echo "║  IT Aman Printer Tool v3.16 installed!          ║"
+    echo "║  IT Aman Printer Tool v3.17 installed!          ║"
     echo "╠══════════════════════════════════════════════════╣"
     echo "║  Daemon: ACTIVE (running in background)         ║"
     echo "║  Socket: $SOCKET_DIR/it-aman.sock"

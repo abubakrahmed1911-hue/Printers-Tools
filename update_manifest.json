@@ -2,7 +2,7 @@
   "files": [
     {
       "path": "src/daemon.py",
-      "sha256": "658a3ba67cce360fc1aa591c6bfbd8e8ccab1da3d24cf1727bb825c68aa4ad7c"
+      "sha256": "17d78ccaef5ee48b3f6d0e8084a3977cfacbabeb14863aa14d9886ef13662f0c"
     },
     {
       "path": "src/gui.py",
@@ -10,7 +10,7 @@
     },
     {
       "path": "version.json",
-      "sha256": "4e499d3e3e07b048f4867e09573ad5f139001e0826fbd3ac669526ed3abdd164"
+      "sha256": "eaf97a55a5957ace246a0735eb20b55909fe5b337e7fae47f002143d3199f6b6"
     },
     {
       "path": "public.pem",
@@ -21,6 +21,6 @@
       "sha256": "458ce643832e42c98c00d251f12eee048e6a58e057cc35ffa957b6c29a23f6dd"
     }
   ],
-  "signature": "f7CKSCrtP6s1TRbpts5h9gZJwAD6BYsPE0OTmMBp/alCpGmCxAI2n7e8h1kH4JtGc3xJMeGukZjLJcUpPzeaDQ==",
+  "signature": "paFO6DMj3A2fGVil5vTcqxwqSYZH3P45KBVZvodMN3pKGz10xUngNkNTWFxCX0X6bQLQDvuzU7W3rSCtUqEaCw==",
   "public_key": "zxTR7vN7LGtHexrB7p2ldzSUCRvc25AOesbsRj6wY+8="
 }

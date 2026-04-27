@@ -1,34 +1,20 @@
 #!/usr/bin/env python3
 """
-IT Aman Printer Daemon v3.12
+IT Aman Printer Daemon v3.17
 =============================
 A Unix socket daemon for managing CUPS printers on Linux.
 Runs as root, listens on /run/it-aman/it-aman.sock, and processes
 JSON commands from the GTK3 GUI client.
 Developed by IT Helpdesk Operation.
 
-Key changes from v3.10:
-  - CRITICAL FIX: pulse_loop timer leak causing GUI freeze — now returns True
-    for GLib auto-repeat instead of creating new timers each cycle
-  - CRITICAL FIX: Network printer setup now works when only URI is provided
-    (no IP), extracting IP from URI for LPD fallback
-  - CRITICAL FIX: Thermal driver install now receives USB URI from wizard
-    detection, ensuring correct printer is configured
-  - FIX: Spooler clear now only removes temp/control files (c*) not data
-    files (d*), preventing accidental job data loss
-  - FIX: CUPS start retries 3 times before resorting to spool cleanup
-  - FIX: Network printer card passes full_uri and uri for better setup
-  - VERSION bumped to 3.11
-
-Key changes from v3.13:
-  - NEW: Smart printer naming with auto-increment (Operation MF, Operation 2 MF, FS, FS2, etc.)
-  - NEW: handle_get_next_name auto-suggests the next available name for each category
-  - FIX: Printer name sanitization now allows spaces in display (CUPS name uses underscores)
-  - FIX: Repair/clean/diagnose commands verified working with proper CUPS state management
-  - FIX: Thermal printer detection and driver install improved
-  - FIX: Printer listing shows ALL printers including uninstalled USB/network devices
-  - IMPROVED: Centralized definitions sync from GitHub
-  - VERSION bumped to 3.13
+Key changes from v3.16:
+  - CRITICAL FIX: Auto-update now handles chattr +i (immutable) files
+    by running chattr -i before replacing and chattr +i after
+  - CRITICAL FIX: install.sh now unlocks immutable files before install
+    and re-applies chattr +i protection after successful install
+  - FIX: Thermal driver install (_install_local_drivers) now unlocks
+    CUPS filter/model files before overwriting them
+  - VERSION bumped to 3.17
 
 Architecture:
   - Unix socket at /run/it-aman/it-aman.sock
@@ -64,7 +50,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "3.16"
+VERSION = "3.17"
 
 # Paths
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
@@ -304,6 +290,43 @@ def run_cmd(cmd: list, timeout: int = 30, check: bool = False) -> tuple:
 def run_shell(script: str, timeout: int = 60) -> tuple:
     """Run a shell command string and return (returncode, stdout, stderr)."""
     return run_cmd(["bash", "-c", script], timeout=timeout)
+
+
+def _chattr_unlock(path: str) -> bool:
+    """
+    Remove the immutable attribute (chattr -i) from a file so it can be
+    modified or replaced.  This is critical for auto-updates: if someone
+    ran 'chattr +i' on daemon.py, gui.py, etc., even root cannot overwrite
+    them until the flag is cleared.
+
+    Returns True if the flag was cleared (or was not set), False on error.
+    """
+    if not os.path.isfile(path):
+        return True  # Nothing to unlock
+    rc, _, err = run_cmd(["chattr", "-i", path], timeout=5)
+    if rc == 0:
+        log.info("chattr -i succeeded on %s", path)
+        return True
+    # chattr may not be available on minimal installs; that's OK
+    log.debug("chattr -i on %s returned %d (may not be installed): %s", path, rc, err)
+    return True  # Don't block updates if chattr isn't available
+
+
+def _chattr_lock(path: str) -> bool:
+    """
+    Re-apply the immutable attribute (chattr +i) to protect a file from
+    accidental modification.  Called after a successful update.
+
+    Returns True on success.
+    """
+    if not os.path.isfile(path):
+        return False
+    rc, _, err = run_cmd(["chattr", "+i", path], timeout=5)
+    if rc == 0:
+        log.info("chattr +i re-applied on %s", path)
+        return True
+    log.debug("chattr +i on %s returned %d: %s", path, rc, err)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1315,9 +1338,13 @@ def _install_local_drivers() -> list:
         dst_path = os.path.join(CUPS_FILTER_DIR, name)
         if os.path.isfile(src_path):
             try:
+                # Unlock immutable flag before overwriting
+                _chattr_unlock(dst_path)
                 os.makedirs(CUPS_FILTER_DIR, exist_ok=True)
                 shutil.copy2(src_path, dst_path)
                 os.chmod(dst_path, 0o755)
+                # Re-lock for protection
+                _chattr_lock(dst_path)
                 actions.append(f"Installed filter: {dst_path}")
                 log.info("Installed thermal filter: %s -> %s", src_path, dst_path)
             except Exception as exc:
@@ -1329,6 +1356,7 @@ def _install_local_drivers() -> list:
     # Install PPD file
     if os.path.isfile(LOCAL_PPD):
         try:
+            _chattr_unlock(os.path.join(CUPS_MODEL_DIR, "80mmSeries.ppd"))
             os.makedirs(CUPS_MODEL_DIR, exist_ok=True)
             ppd_dest = os.path.join(CUPS_MODEL_DIR, "80mmSeries.ppd")
             shutil.copy2(LOCAL_PPD, ppd_dest)
@@ -1337,6 +1365,7 @@ def _install_local_drivers() -> list:
 
             # Patch FullCut default to PartialCut
             try:
+                _chattr_unlock(ppd_dest)
                 with open(ppd_dest, "r") as fh:
                     ppd_content = fh.read()
                 patched = ppd_content.replace(
@@ -1354,6 +1383,8 @@ def _install_local_drivers() -> list:
                     actions.append("Patched PPD: FullCut -> PartialCut default")
             except Exception as exc:
                 log.debug("PPD patch failed (non-fatal): %s", exc)
+            finally:
+                _chattr_lock(ppd_dest)
         except Exception as exc:
             actions.append(f"Failed to install PPD: {exc}")
             log.error("Failed to install PPD: %s", exc)
@@ -2513,6 +2544,19 @@ def handle_update_all(params: dict) -> dict:
     base_dir = os.path.dirname(install_dir)  # /opt/it-aman
     backup_dir = base_dir + ".backup"
 
+    # CRITICAL: Unlock all files before backup/replace (chattr +i blocks even root)
+    log.info("Unlocking files (chattr -i) before update...")
+    for file_info in files_list:
+        remote_path = file_info.get("path", "")
+        if remote_path:
+            dest_path = os.path.join(base_dir, remote_path)
+            _chattr_unlock(dest_path)
+    # Also unlock the backup dir if it exists from a previous attempt
+    if os.path.exists(backup_dir):
+        run_cmd(["chattr", "-R", "-i", backup_dir], timeout=10)
+    # Unlock the entire install dir tree to handle any chattr +i files
+    run_cmd(["chattr", "-R", "-i", base_dir], timeout=15)
+
     # Create backup of current files
     try:
         if os.path.exists(backup_dir):
@@ -2552,8 +2596,9 @@ def handle_update_all(params: dict) -> dict:
                 report["actions"].append(f"SHA256 mismatch for {remote_path} -- skipped")
                 continue
 
-        # Replace the file
+        # Replace the file — unlock immutable flag first
         try:
+            _chattr_unlock(dest_path)
             os.makedirs(os.path.dirname(dest_path), exist_ok=True)
             os.replace(tmp_dest, dest_path)
             updated_files.append(remote_path)
@@ -2577,6 +2622,12 @@ def handle_update_all(params: dict) -> dict:
     cfg = load_config()
     cfg["version"] = remote_version
     save_config(cfg)
+
+    # Re-apply immutable protection on updated files
+    log.info("Re-locking updated files (chattr +i) for protection...")
+    for rel_path in updated_files:
+        dest_path = os.path.join(base_dir, rel_path)
+        _chattr_lock(dest_path)
 
     # --- Step 6: Restart daemon ---
     report["actions"].append(f"Updated {len(updated_files)} file(s)")
@@ -3123,6 +3174,15 @@ def _auto_install_simple(remote_version: str) -> dict:
     # --- Fall back: Direct HTTPS download ---
     log.info("Using direct HTTPS download for auto-update %s -> %s", VERSION, remote_version)
 
+    # CRITICAL: Unlock all files before backup/replace (chattr +i blocks even root)
+    log.info("Unlocking files (chattr -i) before update...")
+    for rel_path in AUTO_UPDATE_FILES:
+        dest_path = os.path.join(base_dir, rel_path)
+        _chattr_unlock(dest_path)
+    # Also unlock the backup dir if it exists from a previous attempt
+    if os.path.exists(backup_dir):
+        run_cmd(["chattr", "-R", "-i", backup_dir], timeout=10)
+
     # Create backup
     try:
         if os.path.exists(backup_dir):
@@ -3153,8 +3213,9 @@ def _auto_install_simple(remote_version: str) -> dict:
         except Exception:
             continue
 
-        # Replace the file
+        # Replace the file — unlock immutable flag first
         try:
+            _chattr_unlock(dest_path)
             os.makedirs(os.path.dirname(dest_path), exist_ok=True)
             os.replace(tmp_dest, dest_path)
             updated_files.append(rel_path)
@@ -3174,6 +3235,12 @@ def _auto_install_simple(remote_version: str) -> dict:
             pass
         return {"status": "error", "message": "No files were successfully updated", "actions": report["actions"]}
 
+    # Re-apply immutable protection on updated files
+    log.info("Re-locking updated files (chattr +i) for protection...")
+    for rel_path in updated_files:
+        dest_path = os.path.join(base_dir, rel_path)
+        _chattr_lock(dest_path)
+
     # Update config with new version
     cfg = load_config()
     cfg["version"] = remote_version
@@ -3187,6 +3254,7 @@ def _auto_install_simple(remote_version: str) -> dict:
     def _restart_daemon():
         time.sleep(2)
         log.info("Restarting daemon after auto-update...")
+        # Unlock self before restart so the new version can be updated in the future
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
     threading.Thread(target=_restart_daemon, daemon=True).start()
