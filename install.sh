@@ -18,7 +18,7 @@ POLICY_FILE="/usr/share/polkit-1/actions/com.it-aman.gui.policy"
 SUDOERS_FILE="/etc/sudoers.d/it-aman-gui"
 
 echo "========================================"
-echo " IT Aman Printer Tool v3.23 Installer"
+echo " IT Aman Printer Tool v3.24 Installer"
 echo "========================================"
 echo ""
 
@@ -248,7 +248,7 @@ sleep 2
 if systemctl is-active --quiet it-aman.service; then
     echo ""
     echo "╔══════════════════════════════════════════════════╗"
-    echo "║  IT Aman Printer Tool v3.23 installed!          ║"
+    echo "║  IT Aman Printer Tool v3.24 installed!          ║"
     echo "╠══════════════════════════════════════════════════╣"
     echo "║  Daemon: ACTIVE (running in background)         ║"
     echo "║  Socket: $SOCKET_DIR/it-aman.sock"

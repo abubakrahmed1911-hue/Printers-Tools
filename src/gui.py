@@ -34,7 +34,7 @@ import re
 
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
 CONFIG_PATH = "/etc/it-aman/config.json"
-APP_VERSION = "3.23"
+APP_VERSION = "3.24"
 APP_NAME = "IT Aman - Printer Support Tool"
 DEVELOPER = "Developed by: IT Helpdesk Operation"
 
@@ -704,6 +704,43 @@ def pulse_loop(progress_bar):
         return True  # GLib will auto-repeat — do NOT add another timeout_add
     except Exception:
         return False
+
+
+def size_win_get(size_name="medium"):
+    """
+    Smart dynamic window sizing based on screen geometry.
+    Returns (width, height) for the given size name:
+      - "small":     Compact dialogs (naming, confirmations)
+      - "medium":    Default main window
+      - "large":      Full content views (status, scan results)
+      - "wide":       Wide layouts (network printer list)
+      - "progress":   Minimal progress/status windows
+    Respects screen boundaries — never exceeds 90% of monitor.
+    """
+    # Size presets as fractions of screen: (width_frac, height_frac, max_w, max_h)
+    PRESETS = {
+        "small":    (0.35, 0.40, 480, 380),
+        "medium":   (0.50, 0.55, 720, 520),
+        "large":    (0.70, 0.75, 900, 700),
+        "wide":     (0.80, 0.60, 1000, 550),
+        "progress": (0.30, 0.25, 400, 260),
+    }
+    w_frac, h_frac, max_w, max_h = PRESETS.get(size_name, PRESETS["medium"])
+
+    display = Gdk.Display.get_default()
+    if display:
+        monitor = display.get_primary_monitor()
+        if monitor:
+            geom = monitor.get_geometry()
+            # Never exceed 90% of screen
+            cap_w = int(geom.width * 0.90)
+            cap_h = int(geom.height * 0.90)
+            w = min(int(geom.width * w_frac), max_w, cap_w)
+            h = min(int(geom.height * h_frac), max_h, cap_h)
+            return max(w, 320), max(h, 240)
+
+    # Fallback
+    return min(max_w, 720), min(max_h, 520)
 
 
 # ──────────────────────────── Screen: Welcome ────────────────────────────
@@ -2484,19 +2521,8 @@ class ITAmanApp(Gtk.Window):
     # ── setup ──
 
     def _setup_window(self):
-        display = Gdk.Display.get_default()
-        if display:
-            monitor = display.get_primary_monitor()
-            if monitor:
-                geom = monitor.get_geometry()
-                # Lightweight default: 50% width (max 720), 55% height (max 520)
-                w = min(int(geom.width * 0.50), 720)
-                h = min(int(geom.height * 0.55), 520)
-                self.set_default_size(w, h)
-            else:
-                self.set_default_size(720, 520)
-        else:
-            self.set_default_size(720, 520)
+        w, h = size_win_get("medium")
+        self.set_default_size(w, h)
 
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_resizable(True)

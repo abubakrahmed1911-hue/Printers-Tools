@@ -50,7 +50,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "3.23"
+VERSION = "3.24"
 
 # Paths
 SOCKET_PATH = "/run/it-aman/it-aman.sock"
@@ -339,6 +339,42 @@ def _chattr_unlock(path: str) -> bool:
     return True  # Don't block updates if chattr isn't available
 
 
+def _cleanup_tmp_files():
+    """
+    Explicitly clean up stale /tmp files left by previous daemon runs.
+    Removes temporary directories and files matching known prefixes:
+      - /tmp/kyocera_*, /tmp/xprinter_*, /tmp/sprt_*, /tmp/testprint_*
+      - /tmp/ed25519_*, /tmp/it-aman.service.*
+      - /tmp/it-aman-update_*
+    This runs at daemon startup and after updates to prevent /tmp bloat.
+    """
+    prefixes = [
+        "kyocera_", "xprinter_", "sprt_", "testprint_",
+        "ed25519_", "it-aman.service.", "it-aman-update_",
+    ]
+    tmp_dir = "/tmp"
+    cleaned = 0
+    try:
+        for entry in os.listdir(tmp_dir):
+            for prefix in prefixes:
+                if entry.startswith(prefix):
+                    full_path = os.path.join(tmp_dir, entry)
+                    try:
+                        if os.path.isdir(full_path):
+                            shutil.rmtree(full_path, ignore_errors=True)
+                        else:
+                            os.remove(full_path)
+                        cleaned += 1
+                        log.debug("Cleaned up stale tmp: %s", full_path)
+                    except Exception as exc:
+                        log.debug("Could not clean %s: %s", full_path, exc)
+                    break  # Already matched a prefix, no need to check others
+    except Exception as exc:
+        log.warning("Error during /tmp cleanup: %s", exc)
+    if cleaned > 0:
+        log.info("Cleaned up %d stale /tmp files from previous runs", cleaned)
+
+
 # NOTE: No _chattr_lock() — we do NOT re-apply chattr +i after updates.
 # chattr +i was causing problems: employees delete files anyway, and the
 # immutable flag breaks auto-updates. We only UNLOCK (chattr -i), never lock.
@@ -455,41 +491,93 @@ def scan_subnet_tcp(subnet: str) -> list[dict]:
 # HTTP model probe (used by network_scan)
 # ---------------------------------------------------------------------------
 
+def _http_probe_single_url(url: str, timeout: float) -> str | None:
+    """
+    Probe a single URL for printer model info.
+    Returns model string or None. Uses short timeout for speed.
+    """
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": _USER_AGENT,
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            # Only read first 8KB — enough for model info, avoids slow reads
+            body = resp.read(8192).decode("utf-8", errors="replace")
+            for pattern in [
+                r'<title>(.*?)</title>',
+                r'printer-model["\s:]+(["\']?)([^"\']+)\1',
+                r'product\s*=\s*"([^"]+)"',
+                r'Model[^:]*:\s*([^\n<]+)',
+            ]:
+                m = re.search(pattern, body, re.IGNORECASE)
+                if m:
+                    # For the printer-model pattern, group 2 has the value
+                    if pattern == r'printer-model["\s:]+(["\']?)([^"\']+)\1':
+                        model = m.group(2).strip()
+                    else:
+                        model = m.group(1).strip()
+                    if model and len(model) < 200:
+                        return model
+    except Exception:
+        pass
+    return None
+
+
 def http_probe_model(ip: str) -> str | None:
     """
     Try to determine the printer model via HTTP/IPP queries.
-    Queries:
-      1. http://IP:631/ipp/print (CUPS IPP Everywhere resource)
-      2. http://IP/index.html    (common printer web UI)
+    Uses CONCURRENT probes with SHORT timeout (2s) and EARLY TERMINATION
+    on first success — keeps detection fast and lightweight.
+    Probe URLs (tried in parallel):
+      1. http://IP:631/ipp/print              (CUPS IPP Everywhere)
+      2. http://IP/index.html                 (common printer web UI)
+      3. http://IP/                           (root page redirect)
+      4. http://IP/ipp/print                  (IPP without port)
+      5. http://IP/info/overview.html          (Ricoh CGI path)
+      6. http://IP/gw_webcgi/overview.html     (Ricoh alternate)
     Returns model string or None.
     """
+    PROBE_TIMEOUT = 2  # Short timeout per URL — 2s is enough for LAN
+
     urls_to_try = [
         f"http://{ip}:631/ipp/print",
         f"http://{ip}/index.html",
+        f"http://{ip}/",
+        f"http://{ip}/ipp/print",
+        f"http://{ip}/info/overview.html",
+        f"http://{ip}/gw_webcgi/overview.html",
     ]
-    for url in urls_to_try:
-        try:
-            req = urllib.request.Request(url, headers={
-                "User-Agent": _USER_AGENT,
-            })
-            with urllib.request.urlopen(req, timeout=MODEL_PROBE_TIMEOUT) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
-                # Look for common model patterns
-                for pattern in [
-                    r'<title>(.*?)</title>',
-                    r'printer-model["\s:]+(["\']?)([^"\']+)\1',
-                    r'product\s*=\s*"([^"]+)"',
-                    r'Model[^:]*:\s*([^\n<]+)',
-                ]:
-                    m = re.search(pattern, body, re.IGNORECASE)
-                    if m:
-                        model = m.group(1 if pattern != r'product\s*=\s*"([^"]+)"' else 1).strip()
-                        if model and len(model) < 200:
-                            log.info("HTTP probe for %s found model: %s", ip, model)
-                            return model
-        except Exception:
-            continue
-    return None
+
+    # Probe all URLs concurrently, return on FIRST success (early termination)
+    result_box = [None]  # Use list so nested function can modify
+    done_flag = threading.Event()
+
+    def _probe_url(url):
+        if done_flag.is_set():
+            return  # Another thread already found it
+        model = _http_probe_single_url(url, PROBE_TIMEOUT)
+        if model:
+            result_box[0] = model
+            done_flag.set()  # Signal other threads to stop
+
+    # Use small pool (max 4) to avoid overwhelming the printer
+    with ThreadPoolExecutor(max_workers=min(4, len(urls_to_try))) as pool:
+        futures = [pool.submit(_probe_url, u) for u in urls_to_try]
+        # Wait for all to complete (or early termination)
+        for fut in as_completed(futures):
+            if done_flag.is_set():
+                break
+            try:
+                fut.result()
+            except Exception:
+                pass
+
+    model = result_box[0]
+    if model:
+        log.info("HTTP probe for %s found model: %s", ip, model)
+    else:
+        log.debug("HTTP probe for %s: no model found", ip)
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -671,14 +759,93 @@ def install_kyocera_driver() -> bool:
 # Thermal printer cut-defaults helper
 # ---------------------------------------------------------------------------
 
+def value_size_thermal_pick(printer_name: str) -> str:
+    """
+    Detect the best paper size for a thermal printer by examining
+    its current CUPS media options and PPD-supported sizes.
+    Returns a media= string like 'media=80mm' or 'media=58mm' or 'media=Custom.WIDTHxHEIGHTmm'.
+    """
+    # Step 1: Check current lpoptions for the printer
+    rc, out, _ = run_cmd(["lpoptions", "-p", printer_name], timeout=10)
+    if rc == 0 and out:
+        size = resolve_thermal_size_from_tokens(out)
+        if size:
+            log.info("Detected thermal size from lpoptions for %s: %s", printer_name, size)
+            return size
+
+    # Step 2: Check PPD file for supported media sizes
+    rc, out, _ = run_cmd(["lpinfo", "-l", "-m"], timeout=15)
+    if rc == 0 and out:
+        size = resolve_thermal_size_from_tokens(out)
+        if size:
+            log.info("Detected thermal size from PPD for %s: %s", printer_name, size)
+            return size
+
+    # Step 3: Check USB URI for clues (XP-80 => 80mm, etc.)
+    device_uri = _get_printer_device_uri(printer_name)
+    if device_uri:
+        size = resolve_forced_custom_size_from_tokens(device_uri)
+        if size:
+            log.info("Detected thermal size from device URI for %s: %s", printer_name, size)
+            return size
+
+    # Default fallback: 80mm (most common thermal size)
+    log.info("Using default 80mm for thermal printer %s", printer_name)
+    return "media=80mm"
+
+
+def resolve_thermal_size_from_tokens(text: str) -> str | None:
+    """
+    Scan text (lpoptions output, PPD info, etc.) for thermal paper size clues.
+    Looks for known thermal width markers: 58mm, 80mm, 76mm, etc.
+    Returns a media= string or None.
+    """
+    text_lower = text.lower()
+    # Check for specific thermal widths (order matters: most specific first)
+    thermal_sizes = ["80mm", "76mm", "58mm", "72mm"]
+    for sz in thermal_sizes:
+        # Match "80mm" or "80x" or "80 mm" patterns
+        if re.search(rf'{sz[0:2]}\s*[xX×]?\s*{sz[2:]}', text_lower) or sz in text_lower:
+            return f"media={sz}"
+    # Check for custom width patterns like "Custom.80x210mm"
+    m = re.search(r'Custom\.(\d+)x(\d+)mm', text_lower)
+    if m:
+        return f"media=Custom.{m.group(1)}x{m.group(2)}mm"
+    return None
+
+
+def resolve_forced_custom_size_from_tokens(text: str) -> str | None:
+    """
+    Examine device URI or model name for forced size hints.
+    XP-80 => 80mm, XP-58 => 58mm, etc.
+    """
+    text_lower = text.lower()
+    # Common model-to-size mappings
+    model_size_hints = [
+        (r'xp-?80|80mm|xp80', "media=80mm"),
+        (r'xp-?58|58mm|xp58', "media=58mm"),
+        (r'xp-?76|76mm|xp76', "media=76mm"),
+        (r'tp-?58', "media=58mm"),
+        (r'tp-?80', "media=80mm"),
+    ]
+    for pattern, size_str in model_size_hints:
+        if re.search(pattern, text_lower):
+            return size_str
+    return None
+
+
 def _set_thermal_cut_defaults(printer_name: str):
     """
     Set thermal-printer-specific defaults after installation.
+    Uses smart size detection instead of hardcoded 80mm.
     Ensures the printer uses partial cut and sensible paper sizes.
     """
-    # Common thermal defaults: 80mm paper, no margins, raw mode
+    # Smart size detection — picks best size based on printer model/options
+    media_size = value_size_thermal_pick(printer_name)
+    log.info("Thermal printer %s: selected media size: %s", printer_name, media_size)
+
     lpoptions = [
-        "media=80mm",
+        media_size,
         "orientation-requested=3",   # portrait
     ]
     # Build lpadmin -p NAME -o key=value for each option
@@ -689,7 +856,7 @@ def _set_thermal_cut_defaults(printer_name: str):
     if rc != 0:
         log.warning("Failed to set thermal defaults for %s: %s", printer_name, err)
     else:
-        log.info("Set thermal cut defaults for %s", printer_name)
+        log.info("Set thermal cut defaults for %s (size=%s)", printer_name, media_size)
 
     # Also try to set DocumentCut and FullCut via lpoptions
     cut_opts = [
@@ -2444,11 +2611,12 @@ def handle_test_print(params: dict) -> dict:
         return {"status": "error", "message": f"Printer '{name}' does not exist"}
 
     # Try to print the CUPS test page
+    tmp_dir_testpage = None  # Track for explicit cleanup
     test_page = "/usr/share/cups/data/testprint"
     if not os.path.isfile(test_page):
         # Generate a simple test page
-        tmp_dir = tempfile.mkdtemp(prefix="testprint_")
-        test_page = os.path.join(tmp_dir, "test.txt")
+        tmp_dir_testpage = tempfile.mkdtemp(prefix="testprint_")
+        test_page = os.path.join(tmp_dir_testpage, "test.txt")
         with open(test_page, "w") as fh:
             fh.write("=" * 60 + "\n")
             fh.write("  IT Aman Printer Daemon -- Test Page\n")
@@ -2461,6 +2629,10 @@ def handle_test_print(params: dict) -> dict:
         ["lp", "-d", name, "-o", "fit-to-page", test_page],
         timeout=30,
     )
+
+    # Explicit /tmp cleanup for generated test page
+    if tmp_dir_testpage and os.path.isdir(tmp_dir_testpage):
+        shutil.rmtree(tmp_dir_testpage, ignore_errors=True)
 
     if rc == 0:
         # Extract job ID from output
@@ -2665,6 +2837,9 @@ def handle_update_all(params: dict) -> dict:
     report["actions"].append(f"Updated {len(updated_files)} file(s)")
     report["actions"].append("Daemon will restart to apply updates")
     report["new_version"] = remote_version
+
+    # Clean up any /tmp files from the update process
+    _cleanup_tmp_files()
 
     # Schedule restart in a separate thread so we can send the response first
     _schedule_daemon_restart()
@@ -3257,6 +3432,9 @@ def main():
     log.info("=" * 60)
     log.info("IT Aman Printer Daemon v%s starting", VERSION)
     log.info("=" * 60)
+
+    # Clean up stale /tmp files from previous runs
+    _cleanup_tmp_files()
 
     # Pre-flight checks
     preflight_checks()
